@@ -5,7 +5,7 @@ from reline.nodes import (
     FileWriterNode,
 )
 from reline.pipeline import Pipeline
-from starlette.websockets import WebSocket
+from starlette.websockets import WebSocket, WebSocketDisconnect
 import asyncio
 
 
@@ -23,20 +23,28 @@ class PipelineWs(Pipeline):
         data = []
         data_len = 0
 
-        async def send_status(status: str, progress: int) -> None:
-            await ws.send_json(
-                {
-                    "status": status,
-                    "progress": progress,
-                    "data_len": data_len,
-                }
-            )
+        async def safe_send(status: str, progress: int) -> bool:
+            try:
+                await ws.send_json(
+                    {
+                        "status": status,
+                        "progress": progress,
+                        "data_len": data_len,
+                    }
+                )
+                return True
+            except WebSocketDisconnect:
+                cancel_event.set()
+                return False
+            except Exception:
+                cancel_event.set()
+                return False
 
         nodes_index = 0
 
         while nodes_index < len(self.nodes):
             if cancel_event.is_set():
-                await send_status("cancelled", 0)
+                await safe_send("cancelled", 0)
                 return
 
             node = self.nodes[nodes_index]
@@ -44,6 +52,7 @@ class PipelineWs(Pipeline):
             if isinstance(node, (FileReaderNode, FolderReaderNode)):
                 data = node.single_process(data)
                 data_len = len(data)
+
                 writer_index: int | None = None
                 for i, n in enumerate(
                     self.nodes[nodes_index + 1 :], start=nodes_index + 1
@@ -54,30 +63,32 @@ class PipelineWs(Pipeline):
 
                 for img_index, img in enumerate(data):
                     if cancel_event.is_set():
-                        await send_status("cancelled", img_index)
+                        await safe_send("cancelled", img_index)
                         return
 
                     if img is None:
                         continue
 
-                    await send_status("running", img_index)
+                    if not await safe_send("running", img_index):
+                        return
+
                     await asyncio.sleep(0)
 
                     for inner_index in range(nodes_index + 1, len(self.nodes)):
                         if cancel_event.is_set():
-                            await send_status("cancelled", img_index)
+                            await safe_send("cancelled", img_index)
                             return
 
                         inner_node = self.nodes[inner_index]
-                        img = inner_node.single_process(img)
+                        img = await asyncio.to_thread(inner_node.single_process, img)
 
                         if isinstance(inner_node, (FolderWriterNode, FileWriterNode)):
                             break
+
                 nodes_index = (
                     (writer_index + 1) if writer_index is not None else len(self.nodes)
                 )
             else:
                 nodes_index += 1
 
-        del data
-        await send_status("done", data_len)
+        await safe_send("done", data_len)

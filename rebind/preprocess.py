@@ -124,9 +124,17 @@ def _search_model(root_dir: str, name: str) -> str | None:
 
 
 def _download(url: str, dest: str) -> None:
-    with urllib.request.urlopen(url, timeout=120) as resp, open(dest, "wb") as f:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+        },
+    )
+    with urllib.request.urlopen(request, timeout=120) as resp, open(dest, "wb") as f:
         shutil.copyfileobj(resp, f)
-
 
 def _ensure_model(models_dir: str, name: str, url: str | None) -> str:
     installed = _find_installed(models_dir, name)

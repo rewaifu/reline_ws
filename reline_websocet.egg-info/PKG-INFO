@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: reline-websocet
+Version: 0.1.1
+Summary: Add your description here
+Requires-Python: >=3.12
+License-File: LICENSE
+Requires-Dist: fastapi[standard]>=0.129.0
+Requires-Dist: reline>=1.4.0
+Requires-Dist: uvicorn>=0.40.0
+Dynamic: license-file

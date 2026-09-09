@@ -5,6 +5,8 @@ description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi[standard]>=0.129.0",
+    "msgpack>=1.2.2",
+    "patool>=4.1.0",
     "reline>=1.4.0",
     "uvicorn>=0.40.0",
 ]

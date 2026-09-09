@@ -1,94 +1,161 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from typing import Any, Awaitable, Callable
+
 from reline.nodes import (
     FileReaderNode,
     FolderReaderNode,
-    FolderWriterNode,
     FileWriterNode,
+    FolderWriterNode,
 )
 from reline.pipeline import Pipeline
-from starlette.websockets import WebSocket, WebSocketDisconnect
-import asyncio
+
+READER_NODES = (FileReaderNode, FolderReaderNode)
+WRITER_NODES = (FileWriterNode, FolderWriterNode)
+from reline.nodes.folder_reader.node import ImageIterator
+from reline.static import ImageFile
+from pepeline import read, ImgFormat
+
+# Progress split across phases: preprocessors occupy the first
+# PREPROCESS_SHARE percent of the bar, the pipeline images take the rest.
+PREPROCESS_SHARE = 50
+
+
+def _patched_next(self) -> "ImageFile | None":
+    """Upstream ImageIterator forgets to advance `current` when a file fails
+    to decode, so one broken file makes `next()` return None forever and the
+    processing loop spins. This copy advances before returning the miss."""
+    if self.current >= self.end:
+        raise StopIteration
+    file_path = self.image_paths[self.current]
+    commonprefix = os.path.commonprefix([self.dir_path, file_path])
+    dirpath = os.path.dirname(os.path.relpath(file_path, commonprefix))
+    basename, _ = os.path.splitext(os.path.basename(file_path))
+    self.current += 1
+    try:
+        data = read(file_path, self.mode, ImgFormat.F32)
+    except Exception as e:
+        logging.warning(f"image {basename} not decoded due to error: {e}")
+        return None
+    return ImageFile(data, basename, dirpath)
+
+
+ImageIterator.__next__ = _patched_next
+# PREPROCESS_SHARE percent of the bar, the pipeline images take the rest.
+PREPROCESS_SHARE = 50
+
+SendEvent = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+
+def resolve_path(path: str, root: str | None) -> str:
+    """Absolute paths are kept as-is; anything else is joined onto root."""
+    if not root:
+        return path
+    if path == root or path.startswith(root.rstrip(os.sep) + os.sep):
+        return path
+    return os.path.join(root, path)
+
+
+def split_config(data: Any) -> tuple[list[dict], list[dict]]:
+    """Config arrives as {nodes, preprocess} or as a legacy flat list.
+
+    Returns (nodes, preprocessors) — preprocessors run before the pipeline.
+    """
+    if isinstance(data, list):
+        return data, []
+    nodes = data.get("nodes") or []
+    preprocess = data.get("preprocess") or []
+    return nodes, preprocess
+
 
 
 class PipelineWs(Pipeline):
+    """Pipeline runner speaking the WS_API.md envelope protocol."""
+
     @classmethod
-    def from_json(cls, data: dict) -> "PipelineWs":
-        base = super().from_json(data)
-        instance = cls.__new__(cls)
-        instance.__dict__ = base.__dict__
-        return instance
+    def prepare_config(cls, data: Any, root: str | None) -> tuple[list[dict], list[dict]]:
+        """Split the config into (nodes, preprocess) and resolve node paths
+        against root. The pipeline itself is built later, AFTER the
+        preprocessors ran — download rewrites upscale model paths in place."""
+        nodes, preprocess = split_config(data)
+        for item in nodes:
+            options = item.get("options") if isinstance(item, dict) else None
+            if isinstance(options, dict) and isinstance(options.get("path"), str):
+                options["path"] = resolve_path(options["path"], root)
+        return nodes, preprocess
 
-    async def process_linear_ws(
-        self, ws: WebSocket, cancel_event: asyncio.Event
-    ) -> None:
-        data = []
+    @classmethod
+    def build(cls, nodes: list[dict]) -> "PipelineWs":
+        """Construct after preprocessors ran (they may rewrite options)."""
+        return cls(Pipeline.from_json(nodes).nodes)
+
+    async def process_ws(
+        self,
+        send_event: SendEvent,
+        cancel_event: asyncio.Event,
+        has_preprocess: bool,
+    ) -> bool:
+        """Run reader→per-image→writer groups, emitting `progress` events.
+
+        Returns True when finished on its own, False when cancelled.
+        """
+        data: list = []
         data_len = 0
+        last_percent = -1
 
-        async def safe_send(status: str, progress: int) -> bool:
-            try:
-                await ws.send_json(
-                    {
-                        "status": status,
-                        "progress": progress,
-                        "data_len": data_len,
-                    }
-                )
-                return True
-            except WebSocketDisconnect:
-                cancel_event.set()
-                return False
-            except Exception:
-                cancel_event.set()
-                return False
+        async def send_progress(percent: int) -> None:
+            nonlocal last_percent
+            percent = max(percent, last_percent)
+            if percent != last_percent:
+                last_percent = percent
+                await send_event("progress", {"percent": min(percent, 100)})
 
-        nodes_index = 0
+        def image_percent(img_index: int) -> int:
+            base = PREPROCESS_SHARE if has_preprocess else 0
+            return base + round((100 - base) * img_index / max(data_len, 1))
 
-        while nodes_index < len(self.nodes):
+        index = 0
+        while index < len(self.nodes):
             if cancel_event.is_set():
-                await safe_send("cancelled", 0)
-                return
+                return False
 
-            node = self.nodes[nodes_index]
+            node = self.nodes[index]
 
-            if isinstance(node, (FileReaderNode, FolderReaderNode)):
-                data = node.single_process(data)
+            if isinstance(node, READER_NODES):
+                data = await asyncio.to_thread(node.single_process, data)
                 data_len = len(data)
 
                 writer_index: int | None = None
-                for i, n in enumerate(
-                    self.nodes[nodes_index + 1 :], start=nodes_index + 1
-                ):
-                    if isinstance(n, (FolderWriterNode, FileWriterNode)):
+                for i, n in enumerate(self.nodes[index + 1 :], start=index + 1):
+                    if isinstance(n, WRITER_NODES):
                         writer_index = i
                         break
 
                 for img_index, img in enumerate(data):
                     if cancel_event.is_set():
-                        await safe_send("cancelled", img_index)
-                        return
-
+                        return False
                     if img is None:
                         continue
 
-                    if not await safe_send("running", img_index):
-                        return
-
+                    await send_progress(image_percent(img_index))
                     await asyncio.sleep(0)
 
-                    for inner_index in range(nodes_index + 1, len(self.nodes)):
+                    for inner_index in range(index + 1, len(self.nodes)):
                         if cancel_event.is_set():
-                            await safe_send("cancelled", img_index)
-                            return
+                            return False
 
                         inner_node = self.nodes[inner_index]
                         img = await asyncio.to_thread(inner_node.single_process, img)
 
-                        if isinstance(inner_node, (FolderWriterNode, FileWriterNode)):
+                        if isinstance(inner_node, WRITER_NODES):
                             break
 
-                nodes_index = (
-                    (writer_index + 1) if writer_index is not None else len(self.nodes)
-                )
+                index = (writer_index + 1) if writer_index is not None else len(self.nodes)
             else:
-                nodes_index += 1
+                index += 1
 
-        await safe_send("done", data_len)
+        await send_progress(100)
+        return True

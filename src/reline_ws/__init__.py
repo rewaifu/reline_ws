@@ -5,3 +5,6 @@ the frontend repo (`WS_API.md`). Import `reline_ws.server` (or run the root
 `app.py`) to start it; nothing here is imported by the tests that only need
 frames and progress arithmetic.
 """
+
+#: kept in step with pyproject.toml; reported by `/health`
+__version__ = "0.2.0"

@@ -12,27 +12,36 @@ The wire protocol is specified in the frontend repository: **`WS_API.md`**.
 ```bash
 uv venv
 uv pip install -e .
+.venv/bin/python app.py --root /data --models weights   # or plain uvicorn:
 .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
-Environment:
+Launch parameters — where this machine reads and writes:
 
-| Variable            | Default           | Meaning                                              |
-| ------------------- | ----------------- | ---------------------------------------------------- |
-| `RELINE_MODELS_DIR` | `/content/models` | where `download` preprocessors install upscale models |
+| Flag        | Environment          | Default           | Meaning                                                          |
+| ----------- | -------------------- | ----------------- | ---------------------------------------------------------------- |
+| `--root`    | `RELINE_ROOT`        | *(unset)*         | base for every relative path in a config                         |
+| `--models`  | `RELINE_MODELS_DIR`  | `/content/models` | where `download` installs models and installed ones are searched |
+| `--host`    | `RELINE_HOST`        | `0.0.0.0`         | interface to bind                                                |
+| `--port`    | `RELINE_PORT`        | `8000`            | port to bind                                                     |
+| `--no-proxy-headers` | —           | off               | ignore `X-Forwarded-*` instead of trusting a local proxy         |
+
+`GET /health` reports them back (`"root"`, `"models"`), so which folder a
+deployment is using is one curl away.
 
 One run at a time across all connections (GPU-bound work): a second `start`
 answers `error {"worker busy"}`.
 
-## Path bases (optional)
+## Path bases
 
-A `start` may carry two optional bases, and `ls` one:
+A deployment sets its bases once, at launch; the UI only has to know the
+address. A client *may* still override either one per run.
 
-| Field         | Sent by | Meaning                                                                 |
-| ------------- | ------- | ----------------------------------------------------------------------- |
-| `root`        | `start`, `ls` | base for every node path, the configs folder and a relative `models`; remembered per connection |
-| `models`      | `start` | folder downloads land in and installed models are searched in           |
-| `configs`     | `start` | folder behind `config_list/read/delete`                                 |
+| Field     | Sent by       | Meaning                                                                    |
+| --------- | ------------- | -------------------------------------------------------------------------- |
+| `root`    | `start`, `ls` | base for every node path, the configs folder and a relative `models`; remembered per connection |
+| `models`  | `start`       | folder downloads land in and installed models are searched in               |
+| `configs` | `start`       | folder behind `config_list/read/delete`                                     |
 
 Rules, in one place (`pipeline.resolve_path`, `session.py`):
 
@@ -43,15 +52,80 @@ Rules, in one place (`pipeline.resolve_path`, `session.py`):
 - otherwise → `join(root, path)`, so a portable config can say `"path": "src"`
   and run from any folder.
 
-`models` is the second base: `RELINE_MODELS_DIR` is only the server-wide
-default, a run may point it anywhere (`models: "weights"` under
-`root: "/data"` means `/data/weights`). Nothing about paths is mandatory.
+`models` is the second base: a relative value (`--models weights` under
+`--root /data`) means `/data/weights`, and the per-run `models` field behaves the
+same way. Nothing about paths is mandatory.
 
 An upscale node is resolved the same way, with one distinction: the wire format
 has no `is_own_model` flag, so `pipeline.looks_like_model_path` decides. A bare
 name (`4x_fake`) is a download request and waits for its `download`
 preprocessor; a path or a file name with a model extension is resolved against
 `root` (an absolute mount path from an old config is left as it is).
+
+## Behind a proxy (the 502 hunt)
+
+The client speaks WebSocket; a proxy in front must pass the upgrade through and
+must not buffer or time out mid-run. In order:
+
+1. **Is the origin alive?** `curl -i http://127.0.0.1:8000/health` on the
+   server. `200 {"ok": true, "version": …}` means the app is up. A `502` (or a
+   refused connection) for *every* path — `/health` included — cannot come from
+   this app: the process is down, or the proxy dials the wrong port/host. A
+   plain `GET /run` answers `404`: the route accepts only the WebSocket upgrade.
+2. **Why did it die?** the uvicorn log is the only witness (a missing
+   `reline`/`torch`, a `download` preprocessor with a dead URL, an OOM kill, or
+   a notebook/container session that ended — that last one looks exactly like a
+   502 on every path).
+3. **Is it listening where the proxy dials?** `ss -ltnp | grep 8000`.
+   `--host 127.0.0.1` is invisible from another container; use `0.0.0.0` and
+   start with `--proxy-headers --forwarded-allow-ips='*'` when a proxy is in
+   front.
+4. **Does the proxy upgrade?** nginx:
+   ```nginx
+   location /run {
+       proxy_pass http://127.0.0.1:8000;
+       proxy_http_version 1.1;
+       proxy_set_header Upgrade $http_upgrade;
+       proxy_set_header Connection "upgrade";
+       proxy_read_timeout 3600s;   # a run may be longer than the 60 s default
+       proxy_buffering off;
+   }
+   ```
+
+   Apache 2.4.47+:
+
+   ```apache
+   ProxyPass /run ws://127.0.0.1:8000/run upgrade=websocket
+   ProxyPassReverse /run ws://127.0.0.1:8000/run
+   ```
+
+   Without the upgrade bits the handshake fails while `/health` keeps working —
+   the two probes together say whether to look at the process or at the proxy.
+
+The client sends `echo` every 5 s and gives up after 15 s of silence, so any
+idle timeout the proxy applies is reset by traffic.
+
+### Reading the public answer
+
+Two commands, one on the server and one outside, place the fault:
+
+```bash
+# on the server
+curl -s -o /dev/null -w 'local %{http_code}\n' http://127.0.0.1:8000/health
+# from anywhere
+curl -s -o /dev/null -w 'public %{http_code}\n' https://<host>/health
+```
+
+| local | public | meaning |
+| --- | --- | --- |
+| refused | — | uvicorn is not running; read its log (import error, OOM, dead session) |
+| 200 | `404` with a short text body from the *tunnel* itself | the tunnel is no longer registered for that host — it was restarted or its session ended, so the hostname is gone. Start the tunnel again (a quick tunnel hands out a **new** hostname: update the address in the UI) |
+| 200 | `502` / `504` | the tunnel is up, its origin is not: wrong port, `127.0.0.1` instead of `0.0.0.0`, or a dead process on the other side |
+| 200 | `200` on `/health`, WebSocket still fails | only the upgrade path is broken — see the proxy config above |
+
+Note that a `404` from the tunnel is not the app's `404`: FastAPI answers a
+plain `GET /run` with its own `{"detail":"Not Found"}` JSON, while a dead
+hostname answers a short `text/plain` line without JSON.
 
 ## Layout
 

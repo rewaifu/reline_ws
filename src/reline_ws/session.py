@@ -57,16 +57,21 @@ class Connection:
         ws: "WebSocket",
         gate: BusyGate,
         *,
+        root: str | None = None,
         models_dir: str | None = None,
     ) -> None:
         self.ws = ws
         self.gate = gate
-        #: server-wide fallback for model files (`RELINE_MODELS_DIR`)
-        self.default_models_dir = models_dir
-        #: per-run override: `models` from the last `start`
+        #: launch-time bases (`RELINE_ROOT` / `RELINE_MODELS_DIR`): a run may
+        #: override them, but a deployment sets them once and the UI never has
+        #: to know where the data lives. `--models weights` under
+        #: `--root /data` means `/data/weights`, exactly like a node path.
+        self.root: str | None = os.path.abspath(root) if root else None
+        self.default_models_dir = (
+            resolve_path(models_dir, self.root) if models_dir else None
+        )
         self.models_dir: str | None = None
         self.phase = "idle"
-        self.root: str | None = None
         self.configs_dir: str | None = None
         #: request id of the current run: every run event carries it
         self.run_id = 0
@@ -94,11 +99,11 @@ class Connection:
     def resolve_root(self, raw: Any) -> str | None:
         """The base every path of this connection is resolved against.
 
-        Sent by `start`, and optionally by `ls` (browsing before a run, or a
-        different base while the run is going). Once set it sticks for the
-        connection: an `ls` without `root` keeps browsing where `start` pointed.
-        Absolute from now on, so relative node paths resolve against one stable
-        base, and an old config full of absolute paths is left alone.
+        Comes from the launch parameters (`RELINE_ROOT`), and optionally from
+        `start`/`ls` as an override — once set that way it sticks for the
+        connection, so a later `ls` without `root` keeps browsing where the run
+        pointed. Absolute from now on, so relative node paths resolve against
+        one stable base, and an old config full of absolute paths is left alone.
         """
         if isinstance(raw, str) and raw.strip():
             self.root = os.path.abspath(raw)

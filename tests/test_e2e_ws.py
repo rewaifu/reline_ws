@@ -17,15 +17,15 @@ import sys
 import tempfile
 import time
 import zipfile
+from pathlib import Path
 from typing import Any
 
+import httpx
 import numpy as np
 import pepeline
 import websockets
-from pathlib import Path
 
 from _harness import REPO_ROOT, SRC, Checks, finish
-
 from reline_ws.protocol import pack, unpack
 
 LEVEL_OPTIONS = {
@@ -178,9 +178,10 @@ async def scenario(checks: Checks, tmp: str, endpoint: str) -> None:
         checks.eq("the unpacked source was removed", os.path.exists(os.path.join(unpacked, "pack.zip")), False)
         checks.eq("the pipeline ran after the unpack", frames[-1]["d"]["ok"], True)
 
-    # -- `root` (ls + pipeline) and `models`, all relative ---------------
-    # A fresh base: node paths are written the way a portable config would,
-    # relative to the folder the whole run lives in.
+    # -- the launch bases: the client sends a config and nothing else -----
+    # A deployment sets `RELINE_ROOT`/`RELINE_MODELS_DIR` (see `main`), so the
+    # frames below carry no path parameters at all — the same frames the UI
+    # sends.
     base = os.path.join(tmp, "base")
     shutil.copytree(source, os.path.join(base, "src"), dirs_exist_ok=True)
     weight = os.path.join(tmp, "fake.pth")
@@ -188,9 +189,9 @@ async def scenario(checks: Checks, tmp: str, endpoint: str) -> None:
         handle.write(b"pth")
 
     async with websockets.connect(endpoint, max_size=None) as ws:
-        await send(ws, {"m": "ls", "id": 21, "d": {"path": "src/img_00", "root": base}})
+        await send(ws, {"m": "ls", "id": 21, "d": {"path": "src/img_00"}})
         listing = await read_frame(ws)
-        checks.eq("ls autocompletes a relative path inside root", sorted(listing["d"]["entries"]), [f"img_{index:03d}.png" for index in range(10)])
+        checks.eq("ls browses the launch root", sorted(listing["d"]["entries"]), [f"img_{index:03d}.png" for index in range(10)])
 
         await send(
             ws,
@@ -205,22 +206,19 @@ async def scenario(checks: Checks, tmp: str, endpoint: str) -> None:
                             {"type": "folder_writer", "options": {"path": "done", "format": "png"}},
                         ],
                         [{"type": "download", "options": {"name": "fake", "url": Path(weight).as_uri()}}],
-                    ),
-                    "root": base,
-                    "models": "weights",
+                    )
                 },
             },
         )
         frames = await read_until_done(ws)
-        checks.eq("relative node paths run against root", frames[-1]["d"]["ok"], True)
-        checks.eq("…writing into the root", len(sorted(os.listdir(os.path.join(base, "done")))), 12)
-        checks.eq("a relative models path installs under root", os.path.exists(os.path.join(base, "weights", "fake.pth")), True)
+        checks.eq("relative node paths run against the launch root", frames[-1]["d"]["ok"], True)
+        checks.eq("…writing under it", len(sorted(os.listdir(os.path.join(base, "done")))), 12)
+        checks.eq("a relative launch models folder receives the download", os.path.exists(os.path.join(base, "weights", "fake.pth")), True)
 
-        # a second run without `models` keeps the same folder: the base and the
-        # model folder stick to the connection instead of being re-derived
+        # no frame ever carried this: the connection starts from the launch base
         await send(ws, {"m": "ls", "id": 23, "d": {"path": "src/img_00"}})
         listing = await read_frame(ws)
-        checks.eq("the root from `start` serves later ls", sorted(listing["d"]["entries"]), [f"img_{index:03d}.png" for index in range(10)])
+        checks.eq("a later ls keeps browsing there", sorted(listing["d"]["entries"]), [f"img_{index:03d}.png" for index in range(10)])
 
 
 def main() -> int:
@@ -242,7 +240,14 @@ def main() -> int:
             "warning",
         ],
         cwd=REPO_ROOT,
-        env={**os.environ, "PYTHONPATH": os.pathsep.join([SRC, REPO_ROOT])},
+        env={
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join([SRC, REPO_ROOT]),
+            # a deployment configures its bases once, at launch; the client is
+            # expected to send nothing but the pipeline
+            "RELINE_ROOT": os.path.join(tmp, "base"),
+            "RELINE_MODELS_DIR": "weights",
+        },
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -254,6 +259,16 @@ def main() -> int:
             raise AssertionError(f"server did not start on port {port}:\n{output}")
         checks.ok("the server answers on the endpoint")
         asyncio.run(scenario(checks, tmp, f"ws://127.0.0.1:{port}/run"))
+        # Deployment probes, the ones a 502 hunt needs: `/health` proves the
+        # origin is alive, and a plain GET on `/run` is 404 because the route
+        # only speaks the WebSocket upgrade.
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=10) as http:
+            health = http.get("/health")
+            checks.eq("health answers 200", health.status_code, 200)
+            checks.eq("…with the version", health.json()["ok"], True)
+            checks.eq("…and the launch root it reads from", health.json()["root"], os.path.join(tmp, "base"))
+            checks.eq("…including a relative models folder", health.json()["models"], os.path.join(tmp, "base", "weights"))
+            checks.eq("a plain GET on /run is not a route", http.get("/run").status_code, 404)
     finally:
         server.terminate()
         try:

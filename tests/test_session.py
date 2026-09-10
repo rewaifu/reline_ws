@@ -102,6 +102,15 @@ async def scenario(checks: Checks, tmp: str) -> None:
     checks.eq("without `models` the server default applies", served.resolve_models(None), "/srv/models")
     checks.eq("…and a blank string counts as absent", served.resolve_models("  "), "/srv/models")
 
+    # -- launch-time bases (`--root` / `--models`) ----------------------
+    launched = Connection(socket, BusyGate(), root="data", models_dir="weights")
+    checks.eq("a launch root is absolute from the start", launched.root, os.path.abspath("data"))
+    checks.eq("…and serves a relative ls without any `root` in the frame", launched.resolve_root(None), os.path.abspath("data"))
+    checks.eq("…and a relative models path lands under it", launched.resolve_models(None), os.path.join(os.path.abspath("data"), "weights"))
+    checks.eq("a run may still override the launch root", launched.resolve_root("/elsewhere"), "/elsewhere")
+    checks.eq("…and the models base follows", launched.resolve_models("m"), "/elsewhere/m")
+    checks.eq("a blank override keeps the launch root", launched.resolve_root("  "), "/elsewhere")
+
     # -- presets -------------------------------------------------------
     conn.prepare_configs_dir(os.path.join(tmp, "configs"))
     await conn.dispatch({"m": "config_list", "id": 12, "d": {}})

@@ -1061,8 +1061,8 @@ wheels = [
 
 [[package]]
 name = "reline-websocet"
-version = "0.1.1"
-source = { virtual = "." }
+version = "0.2.0"
+source = { editable = "." }
 dependencies = [
     { name = "fastapi", extra = ["standard"] },
     { name = "msgpack" },

@@ -1,7 +1,12 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "reline-websocet"
-version = "0.1.1"
-description = "Add your description here"
+version = "0.2.0"
+description = "WebSocket runner for reline image pipelines (MessagePack protocol)"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi[standard]>=0.129.0",
@@ -10,3 +15,6 @@ dependencies = [
     "reline>=1.4.0",
     "uvicorn>=0.40.0",
 ]
+
+[tool.setuptools.packages.find]
+where = ["src"]

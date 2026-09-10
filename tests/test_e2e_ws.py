@@ -141,6 +141,97 @@ async def scenario(checks: Checks, tmp: str, endpoint: str) -> None:
         checks.eq("…and never reports success", any(frame.get("d", {}).get("ok") is True for frame in broken), False)
         checks.eq("the connection stays usable", broken[-1]["m"], "done")
 
+        # -- a run that would do nothing is a failure, not a green done ----
+        # Reported from a deployment: reader → level with no writer, a folder
+        # that is not mounted, an empty folder — all finished "ok" with no
+        # output, which reads as a tool that simply does not work.
+        await send(
+            ws,
+            {
+                "m": "start",
+                "id": 4,
+                "d": {
+                    "pipeline": pipeline(
+                        [
+                            {"type": "folder_reader", "options": {"path": source, "mode": "rgb"}},
+                            {"type": "level", "options": LEVEL_OPTIONS},
+                        ]
+                    )
+                },
+            },
+        )
+        frames = await read_until_done(ws)
+        checks.eq("a chain without a writer fails", frames[-1]["d"]["ok"], False)
+        checks.true("…saying what is missing", "no writer" in (frames[-1]["d"]["error"] or ""))
+
+        missing = os.path.join(tmp, "not_mounted")
+        await send(
+            ws,
+            {
+                "m": "start",
+                "id": 5,
+                "d": {
+                    "pipeline": pipeline(
+                        [
+                            {"type": "folder_reader", "options": {"path": missing, "mode": "rgb"}},
+                            {"type": "folder_writer", "options": {"path": target, "format": "png"}},
+                        ]
+                    )
+                },
+            },
+        )
+        frames = await read_until_done(ws)
+        checks.eq("a reader folder that is not there fails", frames[-1]["d"]["ok"], False)
+        checks.true("…naming the folder", missing in (frames[-1]["d"]["error"] or ""))
+
+        empty_source = os.path.join(tmp, "empty")
+        empty_target = os.path.join(tmp, "out_empty")
+        os.makedirs(empty_source, exist_ok=True)
+        await send(
+            ws,
+            {
+                "m": "start",
+                "id": 6,
+                "d": {
+                    "pipeline": pipeline(
+                        [
+                            {"type": "folder_reader", "options": {"path": empty_source, "mode": "rgb"}},
+                            {"type": "folder_writer", "options": {"path": empty_target, "format": "png"}},
+                        ]
+                    )
+                },
+            },
+        )
+        frames = await read_until_done(ws)
+        checks.eq("an empty reader folder fails", frames[-1]["d"]["ok"], False)
+        checks.true("…naming the folder", empty_source in (frames[-1]["d"]["error"] or ""))
+        written = sorted(os.listdir(empty_target)) if os.path.isdir(empty_target) else []
+        checks.eq("…and writes no file", written, [])
+
+        await send(ws, {"m": "start", "id": 7, "d": {"pipeline": pipeline([])}})
+        frames = await read_until_done(ws)
+        checks.eq("an empty pipeline fails", frames[-1]["d"]["ok"], False)
+
+        # a refused run must not leave the server busy (the gate is released in
+        # `finally`, and the next start on this very socket proves it)
+        await send(
+            ws,
+            {
+                "m": "start",
+                "id": 8,
+                "d": {
+                    "pipeline": pipeline(
+                        [
+                            {"type": "folder_reader", "options": {"path": source, "mode": "rgb", "recursive": False}},
+                            {"type": "folder_writer", "options": {"path": target, "format": "png"}},
+                        ]
+                    )
+                },
+            },
+        )
+        frames = await read_until_done(ws)
+        checks.eq("the server is free after the refusals", frames[-1]["d"]["ok"], True)
+
     # -- preprocessors, same server, fresh socket ----------------------
     archive = os.path.join(tmp, "pack.zip")
     with zipfile.ZipFile(archive, "w") as zipped:

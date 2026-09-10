@@ -194,6 +194,20 @@ Findings of the review that shaped the code:
   then `done {ok: true}`, which made the UI replace the error it had just shown.
 * **Disabled nodes are not executed.** The UI marks them with `meta.disabled`;
   the runner now honours it (before, a switched-off node still ran).
+* **A run that cannot write is refused, not reported green.** A chain with no
+  writer (or with its only writer switched off) used to read and process every
+  image and then send `done {ok: true}` while nothing reached the disk — the
+  report behind this fix was "I press start and nothing happens". Now the run
+  fails up front with `pipeline has no writer: nothing would be written`, the
+  same way for a chain with no reader and for an entirely empty config.
+* **A reader folder that is not mounted is named.** Upstream `_scandir` logs
+  the `OSError` and returns an empty list, so a path visible in the UI but
+  missing on the runner finished with zero images and a green `done`. The
+  folder is checked after the preprocessors ran (an `unarchive` legitimately
+  creates its own) and the error carries the resolved path.
+* **Zero images is a failure.** If every reader of a pipeline comes up empty,
+  the run ends with `no images found in: <paths>` instead of a success over
+  nothing.
 * **Downloads report bytes and speed** through a streaming copy, so a 300 MB
   model shows real progress instead of a frozen stage.
 

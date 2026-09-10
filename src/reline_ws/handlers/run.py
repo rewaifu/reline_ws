@@ -87,6 +87,8 @@ async def _run_job(
     error_text: str | None = None
     try:
         windows, head = preprocess_windows(preprocess)
+        if not nodes and not preprocess:
+            raise ValueError("pipeline is empty: nothing to do")
         if preprocess:
             keep_going = await run_preprocessors(
                 preprocess,

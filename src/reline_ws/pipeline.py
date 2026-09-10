@@ -73,6 +73,40 @@ def resolve_path(path: str, root: str | None) -> str:
     return os.path.join(root, path)
 
 
+def reader_path(step: "PlanStep") -> str | None:
+    """Folder a reader walks, when it has one (file readers have a file)."""
+    options = getattr(step.node, "options", None)
+    path = getattr(options, "path", None)
+    return path if isinstance(path, str) and path else None
+
+
+def check_steps(steps: list["PlanStep"]) -> None:
+    """Refuse a chain that cannot write, before it reads a single file.
+
+    A run whose writer is missing — or switched off in the UI, which drops it
+    the same way — reads and processes images and then reports success while
+    nothing lands on disk: indistinguishable from "I pressed start and nothing
+    happened". A reader folder that is not there is worse: upstream `_scandir`
+    swallows the error and returns an empty list, so the run finishes green
+    over zero images. Both shapes become `done {ok: false, error}` here, which
+    the run log shows; a preprocess-only run has no steps and is left alone.
+    """
+    if not steps:
+        return
+    if not any(step.is_reader for step in steps):
+        raise ValueError("pipeline has no reader: nothing would be read")
+    if not any(step.is_writer for step in steps):
+        raise ValueError("pipeline has no writer: nothing would be written")
+    for step in steps:
+        if not isinstance(step.node, FolderReaderNode):
+            continue
+        path = reader_path(step)
+        # checked after the preprocessors ran: `unarchive` creates the folder
+        # it unpacks into, and that folder is a normal reader path
+        if path is not None and not os.path.isdir(path):
+            raise ValueError(f"reader folder does not exist: {path}")
+
+
 #: what an installed model file looks like
 MODEL_SUFFIXES = (".pth", ".pt", ".safetensors")
 
@@ -152,6 +186,7 @@ class PipelineWs:
             PlanStep(type=str(item.get("type")), label=label_of(str(item.get("type"))), node=node)
             for item, node in zip(nodes, built)
         ]
+        check_steps(steps)
         return cls(steps)
 
     async def run(
@@ -165,6 +200,7 @@ class PipelineWs:
         the run was cancelled."""
         index = 0
         total_steps = len(self.steps)
+        empty: list[str] = []
         while index < total_steps:
             if cancel_event.is_set():
                 return False
@@ -177,6 +213,8 @@ class PipelineWs:
             await tracker.open_stage(Stage.READ, read_window, label=step.label, node=step.type)
             data = await asyncio.to_thread(step.node.single_process, None)
             total = len(data)
+            if total == 0:
+                empty.append(reader_path(step) or step.label)
 
             end = total_steps
             for position in range(index + 1, total_steps):
@@ -194,6 +232,12 @@ class PipelineWs:
 
             index = end
 
+        # every reader empty: the run "succeeded" over nothing, which reads as
+        # a broken tool — say so instead of writing a green done. A stop that
+        # landed meanwhile stays a stop.
+        readers = sum(1 for step in self.steps if step.is_reader)
+        if not cancel_event.is_set() and empty and len(empty) == readers:
+            raise ValueError(f"no images found in: {', '.join(empty)}")
         return True
 
     async def _run_chain_group(

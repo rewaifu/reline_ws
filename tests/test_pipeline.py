@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -84,6 +86,39 @@ def main() -> int:
 
     checks.eq("wire type becomes a label", label_of("folder_reader"), "Folder Reader")
     checks.eq("single word types stay", label_of("upscale"), "Upscale")
+
+    # -- a chain that cannot write is refused, not silently green --------
+    def raises_with(name: str, fragment: str, fn: Any, *args: Any) -> None:
+        """`raises`, plus the message: these texts reach the user's run log."""
+        try:
+            fn(*args)
+        except ValueError as exc:
+            assert fragment in str(exc), f"{name}: {exc!r} does not mention {fragment!r}"
+            checks.ok(name)
+            return
+        raise AssertionError(f"{name}: expected ValueError")
+
+    work = tempfile.mkdtemp(prefix="reline_ws_steps_")
+    source = os.path.join(work, "in")
+    target = os.path.join(work, "out")
+    os.makedirs(source, exist_ok=True)
+    os.makedirs(target, exist_ok=True)
+    reader = {"type": "folder_reader", "options": {"path": source}}
+    writer = {"type": "folder_writer", "options": {"path": target}}
+
+    raises_with("a chain without a writer is refused", "no writer", PipelineWs.build, [reader])
+    raises_with("a chain without a reader is refused", "no reader", PipelineWs.build, [writer])
+    raises_with(
+        "a reader folder that is not there is refused by name",
+        "not exist",
+        PipelineWs.build,
+        [
+            {"type": "folder_reader", "options": {"path": os.path.join(work, "nope")}},
+            writer,
+        ],
+    )
+    checks.eq("a reader with a writer passes", len(PipelineWs.build([reader, writer]).steps), 2)
+    checks.eq("nothing to chain is not an error here", len(PipelineWs.build([]).steps), 0)
 
     # -- per-image chain ------------------------------------------------
     steps, nodes = fake_steps([0.01, 0.06, 0.01])

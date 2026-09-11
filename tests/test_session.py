@@ -12,10 +12,12 @@ from typing import Any
 from _harness import Checks, finish
 
 from reline_ws.gate import BusyGate
+from reline_ws.handlers import run as run_handler
 from reline_ws.handlers.configs import config_path
 from reline_ws.handlers.fs import list_directory, parse_extensions
 from reline_ws.protocol import E_ECHO, E_ERROR, E_LS, FrameError, done_payload, pack, unpack
 from reline_ws.session import Connection
+from starlette.websockets import WebSocketDisconnect
 
 
 class FakeSocket:
@@ -37,6 +39,20 @@ class FakeSocket:
     @property
     def last(self) -> dict[str, Any]:
         return self.frames[-1]
+
+
+class DeadSocket(FakeSocket):
+    """The client is gone: every write raises, exactly like starlette when the
+    tab was closed mid-run (`ClientDisconnected` from uvicorn looks the same)."""
+
+    def __init__(self, error: type[BaseException] = WebSocketDisconnect) -> None:
+        super().__init__()
+        self.error = error
+        self.writes = 0
+
+    async def send_bytes(self, payload: bytes) -> None:
+        self.writes += 1
+        raise self.error()
 
 
 def make_connection() -> tuple[Connection, FakeSocket]:
@@ -158,6 +174,52 @@ async def scenario(checks: Checks, tmp: str) -> None:
 
     stored = done_payload(ok=False, error="boom")
     checks.eq("done payload carries the failure", (stored["ok"], stored["error"]), (False, "boom"))
+
+    # -- the client vanishes mid-run -----------------------------------
+    dead = DeadSocket()
+    gone = Connection(dead, BusyGate())
+    checks.eq("a healthy send reports success", await Connection(FakeSocket(), BusyGate()).send({"m": "echo", "id": 30, "d": {}}), True)
+    checks.eq("the first failed write reports the dead socket", await gone.send({"m": "progress", "id": 31, "d": {}}), False)
+    checks.eq("…and marks the connection closed", gone.closed, True)
+    checks.eq("…so the run is cancelled at its next checkpoint", gone.cancel_event.is_set(), True)
+    await gone.send_event("progress", {"percent": 2})
+    checks.eq("…never reaching the transport again", dead.writes, 1)
+    await gone.shutdown()
+    checks.eq("shutdown after a dead write stays quiet", gone.closed, True)
+
+    # a serialization bug is not a disconnect: it must still be loud
+    alive = Connection(FakeSocket(), BusyGate())
+    raised = ""
+    try:
+        await alive.send({"m": "x", "id": 32, "d": {"bad": object()}})
+    except Exception as exc:  # noqa: BLE001 - the point is that it raises at all
+        raised = type(exc).__name__
+    checks.true("a packing bug still raises (a dead client must not hide it)", raised != "")
+    checks.eq("…and does not mark the connection closed", alive.closed, False)
+
+    shutdown_conn = Connection(FakeSocket(), BusyGate())
+    await shutdown_conn.shutdown()
+    checks.eq("shutdown closes the connection for good", shutdown_conn.closed, True)
+    checks.eq("…and raises the cancel flag", shutdown_conn.cancel_event.is_set(), True)
+
+    # -- an abandoned run reports nothing, and frees the server --------
+    dead_conn = Connection(DeadSocket(), BusyGate())
+    dead_conn.gate.acquire()
+    dead_conn.phase = "running"
+    dead_conn.mark_closed()
+    await run_handler._run_job(dead_conn, 33, [], [], tmp)
+    checks.eq("an abandoned run writes no frames at all", dead_conn.ws.frames, [])
+    checks.eq("…and still frees the gate", dead_conn.gate.busy, False)
+    checks.eq("…leaving the connection idle", dead_conn.phase, "idle")
+
+    live_conn, live_socket = make_connection()
+    live_conn.gate.acquire()
+    live_conn.phase = "running"
+    live_conn.run_id = 34
+    await run_handler._run_job(live_conn, 34, [], [], tmp)
+    checks.eq("a failure with a live socket still reports done", live_socket.last["m"], "done")
+    checks.eq("…as ok:false", live_socket.last["d"]["ok"], False)
+    checks.true("…with a message", bool(live_socket.last["d"]["error"]))
 
 
 def main() -> int:

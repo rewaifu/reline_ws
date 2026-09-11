@@ -1,10 +1,11 @@
-"""Detailed run progress: one monotone `percent` plus stage, counters, rate
-and ETA (WS_API.md, `progress`).
+"""Detailed run progress: one monotone `percent` per *phase* plus stage,
+counters, rate and ETA (WS_API.md, `progress`).
 
-The bar is a single 0..100 scale shared by every stage of a run. Each stage
-gets a *window* on that scale; within its window a stage reports `done/total`
-and the tracker does the arithmetic. That keeps the accounting in one place —
-the runner only says "stage X at n/m", it never computes percentages.
+A run has up to two phases, and the bar is a single 0..100 scale *inside* one
+of them: the preprocessors (downloads, unpacks) fill it from 0 %, and when they
+are through the process phase starts its own scale from 0 % again. Within a
+phase each stage gets a *window* on that scale and reports `done/total`; the
+tracker does the arithmetic, so the runner only ever says "stage X at n/m".
 
 Sends are throttled (5/s) so a 10k-image run cannot flood the socket, and
 `rate`/`eta` are derived from wall time, not from call counts.
@@ -23,6 +24,18 @@ SendEvent = Callable[[str, dict[str, Any]], Awaitable[None]]
 MIN_INTERVAL_S = 0.2
 #: a rate measured over less than this is noise
 MIN_RATE_WINDOW_S = 0.5
+
+
+class Phase(str, Enum):
+    """Phase of a run, each owning the bar from 0 %.
+
+    The UI draws one bar, so the jump back to 0 % *is* the signal that the
+    preprocessors are through. A single scale shared by both phases could not
+    do that: a 300 MB download would shrink the images to a sliver and the bar
+    could only ever move forward."""
+
+    PREPROCESS = "preprocess"
+    PROCESS = "process"
 
 
 class Stage(str, Enum):
@@ -51,13 +64,11 @@ class Window:
         return self.start + self.span * ratio
 
 
-#: weights of the preprocessors inside the head of the bar: a network download
+#: weights of the preprocessors, relative to each other: a network download
 #: dominates an unpack, so the download branch of the same config gets 4x the
 #: room of an unpack (it can be a 300 MB file, an archive is usually seconds).
 PREPROCESS_WEIGHTS = {"download": 1.0, "unarchive": 0.25}
-#: share of the bar handed to preprocessors when the config has any
-PREPROCESS_SHARE = 0.6
-#: share of the pipeline window spent listing files (scanning is cheap next to
+#: share of the process phase spent listing files (scanning is cheap next to
 #: decoding and filtering, but it is not instant on network storage)
 READ_SHARE = 0.05
 
@@ -71,30 +82,28 @@ def preprocess_weights(preprocess: list[dict[str, Any]]) -> list[float]:
     return weights
 
 
-def preprocess_windows(preprocess: list[dict[str, Any]]) -> tuple[list[Window], float]:
-    """Windows for the preprocessors plus the share they consume overall.
+def preprocess_windows(preprocess: list[dict[str, Any]]) -> list[Window]:
+    """Windows for the preprocessors over the full 0..100 bar of their phase.
 
-    The head of the bar grows with the weight of the section: a model download
-    deserves 60% of the run, a lone unpack about 15%, and a config without
-    preprocessors gives the pipeline the whole bar."""
+    One window per preprocessor item, sized by its weight: a lone unpack gets
+    the whole bar, a download followed by an unpack splits it 4:1."""
     if not preprocess:
-        return [], 0.0
+        return []
     weights = preprocess_weights(preprocess)
     total = sum(weights) or 1.0
-    head = PREPROCESS_SHARE * 100.0 * min(1.0, total)
     windows: list[Window] = []
     cursor = 0.0
     for weight in weights:
-        span = head * weight / total
+        span = 100.0 * weight / total
         windows.append(Window(cursor, cursor + span))
         cursor += span
-    return windows, head
+    return windows
 
 
-def pipeline_windows(head_percent: float) -> tuple[Window, Window]:
-    """(read window, per-image window) of the 0..100 bar."""
-    read_end = head_percent + (100.0 - head_percent) * READ_SHARE
-    return Window(head_percent, read_end), Window(read_end, 100.0)
+def pipeline_windows() -> tuple[Window, Window]:
+    """(read window, per-image window) of the process phase's 0..100 bar."""
+    read_end = 100.0 * READ_SHARE
+    return Window(0.0, read_end), Window(read_end, 100.0)
 
 
 class ProgressTracker:
@@ -111,6 +120,7 @@ class ProgressTracker:
         self._request_id = request_id
         self._clock = clock
         self._started = clock()
+        self._phase = Phase.PROCESS
         self._percent = 0.0
         self._stage: Stage | None = None
         self._window = Window(0.0, 0.0)
@@ -136,6 +146,32 @@ class ProgressTracker:
         return self._clock() - self._started
 
     # -- public API ------------------------------------------------------
+
+    async def begin_phase(self, phase: Phase) -> None:
+        """Enter a phase: the bar goes back to zero and takes its own clock.
+
+        Announced rather than implied — the UI has one bar, and this frame is
+        what makes it restart. `elapsed`, `rate` and `eta` restart with it: a
+        rate measured while a model was downloading says nothing about how fast
+        the images will go."""
+        now = self._clock()
+        self._phase = phase
+        self._started = now
+        self._percent = 0.0
+        self._stage = None
+        self._window = Window(0.0, 0.0)
+        self._label = None
+        self._node = None
+        self._done = 0
+        self._total = 0
+        self._bytes_done = 0
+        self._bytes_total = 0
+        self._stage_started = now
+        self._stage_start_done = 0
+        self._stage_start_percent = 0.0
+        # the reset must reach the UI now, not after the throttle window
+        self._last_sent = -MIN_INTERVAL_S
+        await self._emit(now, force=True)
 
     async def open_stage(
         self,
@@ -261,6 +297,7 @@ class ProgressTracker:
         self._percent = max(self._percent, float(percent))
         payload: dict[str, Any] = {
             "percent": percent,
+            "phase": self._phase.value,
             "stage": (self._stage or Stage.PROCESS).value,
             "elapsed": round(now - self._started, 1),
         }

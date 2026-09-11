@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..pipeline import PipelineWs
 from ..preprocess import MODELS_DIR, run_preprocessors
-from ..progress import ProgressTracker, pipeline_windows, preprocess_windows
+from ..progress import Phase, ProgressTracker, pipeline_windows, preprocess_windows
 from ..protocol import E_ACCEPTED, E_DONE, E_ERROR, done_payload, error_payload
 
 if TYPE_CHECKING:
@@ -86,30 +86,43 @@ async def _run_job(
     cancelled = False
     error_text: str | None = None
     try:
-        windows, head = preprocess_windows(preprocess)
         if not nodes and not preprocess:
             raise ValueError("pipeline is empty: nothing to do")
+        # Two phases, two bars: the preprocessors fill the bar from 0 %, and
+        # `begin_phase` resets it once they are through, so a long download
+        # does not eat the image loop's scale.
         if preprocess:
+            await tracker.begin_phase(Phase.PREPROCESS)
             keep_going = await run_preprocessors(
                 preprocess,
                 nodes,
                 conn.root,
                 tracker,
-                windows,
+                preprocess_windows(preprocess),
                 conn.cancel_event,
                 models_dir,
             )
             cancelled = not keep_going
         if not cancelled:
-            read_window, image_window = pipeline_windows(head)
+            await tracker.begin_phase(Phase.PROCESS)
+            read_window, image_window = pipeline_windows()
             pipeline = PipelineWs.build(nodes)
             cancelled = not await pipeline.run(tracker, conn.cancel_event, read_window, image_window)
         if not cancelled:
             await tracker.finish()
     except Exception as exc:
-        logger.exception("pipeline error")
-        error_text = str(exc) or type(exc).__name__
+        if conn.closed:
+            # Nobody is listening and the cancel event is already set: the tab
+            # is gone, the run is abandoned. Not a pipeline error, so no
+            # traceback and no attempt to report it.
+            logger.info("run aborted: client disconnected")
+        else:
+            logger.exception("pipeline error")
+            error_text = str(exc) or type(exc).__name__
     finally:
         conn.finish_run()
 
-    await conn.send_event(E_DONE, done_payload(ok=error_text is None and not cancelled, cancelled=cancelled, error=error_text))
+    # a closed socket gets no `done`: there is no one to read it, and `send`
+    # would drop it anyway — keeping the check here says so out loud.
+    if not conn.closed:
+        await conn.send_event(E_DONE, done_payload(ok=error_text is None and not cancelled, cancelled=cancelled, error=error_text))

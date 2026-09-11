@@ -13,6 +13,7 @@ from reline_ws.progress import (
     ProgressTracker,
     Stage,
     Window,
+    Phase,
     pipeline_windows,
     preprocess_windows,
     preprocess_weights,
@@ -53,7 +54,7 @@ async def scenario(checks: Checks) -> None:
     recorder = Recorder()
     tracker = ProgressTracker(recorder, request_id=1, clock=clock)
 
-    read_window, image_window = pipeline_windows(0.0)
+    read_window, image_window = pipeline_windows()
     await tracker.open_stage(Stage.READ, read_window, label="Folder Reader", node="folder_reader")
     checks.eq("open_stage announces the step", recorder.last["stage"], "read")
     checks.eq("…with the label", recorder.last["label"], "Folder Reader")
@@ -65,6 +66,7 @@ async def scenario(checks: Checks) -> None:
 
     await tracker.open_stage(Stage.PROCESS, image_window, label="Sharp", node="sharp", total=100)
     checks.eq("process window opens after read", recorder.last["percent"], 5)
+    checks.eq("frames name their phase", recorder.last["phase"], "process")
     checks.eq("counters are reported", (recorder.last["done"], recorder.last["total"]), (0, 100))
 
     clock.advance(1.0)
@@ -100,6 +102,25 @@ async def scenario(checks: Checks) -> None:
     await tracker.finish()
     checks.eq("finish fills the bar", recorder.last["percent"], 100)
 
+    # a new phase restarts the bar: the preprocessors are through, the images
+    # get their own scale instead of the sliver a download would leave them
+    clock.advance(3.0)
+    await tracker.begin_phase(Phase.PREPROCESS)
+    checks.eq("a phase starts at zero", recorder.last["percent"], 0)
+    checks.eq("…and says which one it is", recorder.last["phase"], "preprocess")
+    checks.eq("…with no stage to name yet", "done" in recorder.last, False)
+    checks.eq("…and its own clock", recorder.last["elapsed"], 0.0)
+
+    await tracker.open_stage(Stage.DOWNLOAD, Window(0.0, 100.0), label="4x_a")
+    clock.advance(1.0)
+    await tracker.update(bytes_done=512, bytes_total=1024, force=True)
+    checks.eq("the preprocess phase fills the bar end to end", recorder.last["percent"], 50)
+
+    await tracker.begin_phase(Phase.PROCESS)
+    checks.eq("the process phase resets the bar", recorder.last["percent"], 0)
+    checks.eq("…under its own name", recorder.last["phase"], "process")
+    checks.eq("…and drops the download counters", ("done" in recorder.last, "bytes_done" in recorder.last), (False, False))
+
     # download: bytes, not items
     clock2 = FakeClock()
     recorder2 = Recorder()
@@ -123,18 +144,18 @@ def main() -> int:
     print("progress:", flush=True)
 
     checks.eq("download outweighs unpack", preprocess_weights([{"type": "download"}, {"type": "unarchive"}]), [1.0, 0.25])
-    windows, head = preprocess_windows([{"type": "download"}, {"type": "unarchive"}])
-    checks.eq("head share with a download", round(head, 3), 60.0)
-    checks.eq("download window", (round(windows[0].start, 3), round(windows[0].end, 3)), (0.0, 48.0))
-    checks.eq("unarchive window", (round(windows[1].start, 3), round(windows[1].end, 3)), (48.0, 60.0))
+    windows = preprocess_windows([{"type": "download"}, {"type": "unarchive"}])
+    checks.eq("the preprocess phase owns the whole bar", (windows[0].start, windows[-1].end), (0.0, 100.0))
+    checks.eq("download window", (round(windows[0].start, 3), round(windows[0].end, 3)), (0.0, 80.0))
+    checks.eq("unarchive window", (round(windows[1].start, 3), round(windows[1].end, 3)), (80.0, 100.0))
 
-    lone, lone_head = preprocess_windows([{"type": "unarchive"}])
-    checks.eq("a lone unpack takes a small head", round(lone_head, 3), 15.0)
-    checks.eq("no preprocessors -> no head", preprocess_windows([]), ([], 0.0))
+    lone = preprocess_windows([{"type": "unarchive"}])
+    checks.eq("a lone unpack takes the bar alone", (lone[0].start, lone[0].end), (0.0, 100.0))
+    checks.eq("no preprocessors -> no windows", preprocess_windows([]), [])
 
-    read, images = pipeline_windows(60.0)
-    checks.eq("read window starts where the head ends", read.start, 60.0)
-    checks.eq("images own the rest of the bar", (round(images.start, 3), images.end), (62.0, 100.0))
+    read, images = pipeline_windows()
+    checks.eq("the process phase starts at zero", read.start, 0.0)
+    checks.eq("images own the rest of the bar", (round(images.start, 3), images.end), (5.0, 100.0))
     checks.eq("window maps counters to percent", Window(10.0, 30.0).percent(1, 4), 15.0)
     checks.eq("unknown total keeps the window start", Window(10.0, 30.0).percent(3, 0), 10.0)
 

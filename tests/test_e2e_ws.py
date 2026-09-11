@@ -82,6 +82,95 @@ def pipeline(nodes: list[dict[str, Any]], preprocess: list[dict[str, Any]] | Non
     return {"nodes": nodes, "preprocess": preprocess or []}
 
 
+def read_log(path: str) -> str:
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+#: big enough that a run which ignores the disconnect is still writing when the
+#: checks below look at the output folder
+ABANDON_IMAGES = 240
+
+
+async def abandon(checks: Checks, tmp: str, endpoint: str, log_path: str) -> None:
+    """The tab closes mid-run (the case that used to print a `pipeline error`
+    traceback): the server must read it as a disconnect, stop the batch and
+    free itself for the client that reconnects."""
+    source = os.path.join(tmp, "abandon_in")
+    target = os.path.join(tmp, "abandon_out")
+    make_images(source, ABANDON_IMAGES)
+    ws = await websockets.connect(endpoint, max_size=None)
+    await send(
+        ws,
+        {
+            "m": "start",
+            "id": 50,
+            "d": {
+                "pipeline": pipeline(
+                    [
+                        {"type": "folder_reader", "options": {"path": source, "mode": "rgb", "recursive": False}},
+                        {"type": "level", "options": LEVEL_OPTIONS},
+                        {"type": "folder_writer", "options": {"path": target, "format": "png"}},
+                    ]
+                )
+            },
+        },
+    )
+    checks.eq("the abandoned run starts", (await read_frame(ws))["m"], "accepted")
+    await read_frame(ws)  # real work is in flight now
+    transport = getattr(ws, "transport", None)
+    if transport is not None:
+        transport.abort()  # no close frame: the next write just fails
+    else:
+        await ws.close()
+    checks.ok("the client vanished mid-run")
+
+    # a fresh connection must get the server back: `busy` means the abandoned
+    # run is still holding the gate
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        try:
+            async with websockets.connect(endpoint, max_size=None) as probe:
+                await send(
+                    probe,
+                    {
+                        "m": "start",
+                        "id": 51,
+                        "d": {
+                            "pipeline": pipeline(
+                                [
+                                    {"type": "folder_reader", "options": {"path": os.path.join(tmp, "in"), "mode": "rgb", "recursive": False}},
+                                    {"type": "level", "options": LEVEL_OPTIONS},
+                                    {"type": "folder_writer", "options": {"path": os.path.join(tmp, "after"), "format": "png"}},
+                                ]
+                            )
+                        },
+                    },
+                )
+                frame = await read_frame(probe)
+                if frame["m"] != "accepted":
+                    await asyncio.sleep(0.3)
+                    continue
+                checks.ok("a reconnect takes the server back without waiting for the batch")
+                try:
+                    await read_until_done(probe)
+                except Exception as exc:  # noqa: BLE001 - the server log says why
+                    raise AssertionError(
+                        f"the reconnect run failed: {exc!r}\n\n{read_log(log_path)[-2000:]}"
+                    ) from exc
+        except AssertionError:
+            raise
+        except Exception:  # noqa: BLE001 - reconnect races are expected here
+            await asyncio.sleep(0.3)
+            continue
+        break
+    else:
+        raise AssertionError(f"the server stayed busy after the client vanished\n\n{read_log(log_path)[-2000:]}")
+
+    written = len(sorted(os.listdir(target)))
+    checks.true(f"…and the abandoned batch stopped early ({written} of {ABANDON_IMAGES})", written < ABANDON_IMAGES)
+
+
 async def scenario(checks: Checks, tmp: str, endpoint: str) -> None:
     source = os.path.join(tmp, "in")
     target = os.path.join(tmp, "out")
@@ -116,6 +205,7 @@ async def scenario(checks: Checks, tmp: str, endpoint: str) -> None:
         percents = [frame["d"]["percent"] for frame in progress]
         checks.eq("percent never decreases", percents, sorted(percents))
         checks.eq("the bar ends full", percents[-1], 100)
+        checks.eq("a config without preprocessors has one phase", {frame["d"]["phase"] for frame in progress}, {"process"})
 
         counted = [frame["d"] for frame in progress if frame["d"].get("total") == 12]
         checks.true("counters describe the images", bool(counted) and counted[-1]["done"] == 12)
@@ -306,6 +396,17 @@ async def scenario(checks: Checks, tmp: str, endpoint: str) -> None:
         checks.eq("…writing under it", len(sorted(os.listdir(os.path.join(base, "done")))), 12)
         checks.eq("a relative launch models folder receives the download", os.path.exists(os.path.join(base, "weights", "fake.pth")), True)
 
+        # two phases, two bars: the download fills the bar, then the image loop
+        # starts its own scale instead of inheriting the download's sliver
+        phases = [frame["d"]["phase"] for frame in frames if frame["m"] == "progress"]
+        checks.eq("preprocessors run in their own phase", sorted(set(phases)), ["preprocess", "process"])
+        checks.true("…which comes first", phases.index("preprocess") < phases.index("process"))
+        download_percents = [frame["d"]["percent"] for frame in frames if frame["m"] == "progress" and frame["d"]["phase"] == "preprocess"]
+        image_percents = [frame["d"]["percent"] for frame in frames if frame["m"] == "progress" and frame["d"]["phase"] == "process"]
+        checks.eq("the preprocess phase ends full", download_percents[-1], 100)
+        checks.eq("…and the process phase starts from zero", image_percents[0], 0)
+        checks.true("…climbing to the end", image_percents[-1] == 100 and image_percents == sorted(image_percents))
+
         # no frame ever carried this: the connection starts from the launch base
         await send(ws, {"m": "ls", "id": 23, "d": {"path": "src/img_00"}})
         listing = await read_frame(ws)
@@ -317,6 +418,10 @@ def main() -> int:
     print("e2e ws:", flush=True)
     tmp = tempfile.mkdtemp(prefix="reline_ws_e2e_")
     port = free_port()
+    # the log goes to a file, not a pipe: `abandon` needs to read what the
+    # server said *after* a checkpoint, and a pipe cannot be peeked at.
+    log_path = os.path.join(tmp, "server.log")
+    log_file = open(log_path, "w", encoding="utf-8")
     server = subprocess.Popen(
         [
             sys.executable,
@@ -328,7 +433,7 @@ def main() -> int:
             "--port",
             str(port),
             "--log-level",
-            "warning",
+            "info",
         ],
         cwd=REPO_ROOT,
         env={
@@ -339,15 +444,14 @@ def main() -> int:
             "RELINE_ROOT": os.path.join(tmp, "base"),
             "RELINE_MODELS_DIR": "weights",
         },
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
         text=True,
     )
     try:
         make_images(os.path.join(tmp, "in"), 12)
         if not wait_for_port(port, deadline=time.monotonic() + 60):
-            output = server.stdout.read() if server.stdout is not None else ""
-            raise AssertionError(f"server did not start on port {port}:\n{output}")
+            raise AssertionError(f"server did not start on port {port}:\n{read_log(log_path)}")
         checks.ok("the server answers on the endpoint")
         asyncio.run(scenario(checks, tmp, f"ws://127.0.0.1:{port}/run"))
         # Deployment probes, the ones a 502 hunt needs: `/health` proves the
@@ -360,14 +464,22 @@ def main() -> int:
             checks.eq("…and the launch root it reads from", health.json()["root"], os.path.join(tmp, "base"))
             checks.eq("…including a relative models folder", health.json()["models"], os.path.join(tmp, "base", "weights"))
             checks.eq("a plain GET on /run is not a route", http.get("/run").status_code, 404)
+
+        # Everything the deliberate failures above wrote is behind us: only what
+        # the vanished client produces is read here.
+        marker = len(read_log(log_path))
+        asyncio.run(abandon(checks, tmp, f"ws://127.0.0.1:{port}/run", log_path))
+        time.sleep(0.5)
+        tail = read_log(log_path)[marker:]
+        checks.true("a vanished client is logged as a disconnect", "client disconnected" in tail)
+        checks.eq("…never as a pipeline error", "pipeline error" in tail, False)
     finally:
         server.terminate()
         try:
             server.wait(timeout=10)
         except subprocess.TimeoutExpired:
             server.kill()
-        if server.stdout is not None:
-            server.stdout.close()
+        log_file.close()
         shutil.rmtree(tmp, ignore_errors=True)
     return finish(checks)
 

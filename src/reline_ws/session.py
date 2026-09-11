@@ -78,15 +78,56 @@ class Connection:
         self.cancel_event = asyncio.Event()
         self.job_task: asyncio.Task[None] | None = None
         self._send_lock = asyncio.Lock()
+        #: the socket is gone (closed tab, dropped tunnel). Set by the first
+        #: failed write or by `shutdown`; every send after that is a no-op.
+        self.closed = False
 
     # -- transport -------------------------------------------------------
 
-    async def send(self, message: dict[str, Any]) -> None:
+    async def send(self, message: dict[str, Any]) -> bool:
         """One binary frame; the lock keeps concurrent writers (job events
-        next to request replies) from interleaving partial frames."""
+        next to request replies) from interleaving partial frames.
+
+        Returns False once the socket is gone. A failed write is news about
+        the client, not a server error: it marks the connection closed, wakes
+        the cancel event so the run unwinds at its next checkpoint, and makes
+        every later frame a no-op — instead of a `WebSocketDisconnect` traceback
+        raised from inside the progress reporter, which then masqueraded as a
+        pipeline crash and had the job try to report its failure to a socket
+        that was already dead. `pack` stays outside the guard: a serialization
+        bug is still a bug and must not be mistaken for a disconnect.
+        """
+        if self.closed:
+            return False
         payload = pack(message)
         async with self._send_lock:
-            await self.ws.send_bytes(payload)
+            if self.closed:
+                return False
+            try:
+                await self.ws.send_bytes(payload)
+            except Exception as exc:  # WebSocketDisconnect, ClientDisconnected, OSError
+                self.mark_closed(exc)
+                return False
+        return True
+
+    def mark_closed(self, exc: BaseException | None = None) -> None:
+        """The socket is gone: stop sending, stop the run.
+
+        Cancelling here and not only in `shutdown` matters because a send is
+        often the first thing to notice: the receive loop is parked in
+        `receive_bytes` while the job streams progress, so without this the
+        pipeline would keep processing images nobody will ever see and hold the
+        busy gate — "worker busy" for whoever reconnects next — for the whole
+        run instead of one checkpoint.
+        """
+        if self.closed:
+            return
+        self.closed = True
+        self.cancel_event.set()
+        logger.info(
+            "client disconnected: cancelling the run%s",
+            f" (write failed: {type(exc).__name__})" if exc is not None else "",
+        )
 
     async def reply(self, request_id: int, method: str, d: dict[str, Any] | None = None) -> None:
         await self.send(event(method, request_id, d))
@@ -133,7 +174,7 @@ class Connection:
     async def shutdown(self) -> None:
         """Socket is going away: stop the run and wait for it to unwind, so
         the busy gate is released before the next connection arrives."""
-        self.cancel_event.set()
+        self.mark_closed()
         task = self.job_task
         if task is not None and not task.done():
             try:

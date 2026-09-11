@@ -85,7 +85,31 @@ def main() -> int:
             tar.add(os.path.join(models, "4x_a.pth"), arcname="img.png")
         make_zip(os.path.join(room, "pack.zip"), {"data/inner.tar.gz": open(inner, "rb").read()})
         checks.eq("archives are counted before unpacking", count_archives(room), 1)
-        dearchive(room)
+        events: list[tuple[str, bool]] = []
+        dearchive(room, lambda name, finished: events.append((name, finished)))
+        checks.eq(
+            "an archive is announced before it is unpacked",
+            [name for name, finished in events if not finished],
+            ["pack.zip", "inner.tar.gz"],
+        )
+        checks.eq(
+            "…and counted only once it is on disk",
+            [name for name, finished in events if finished],
+            ["pack.zip", "inner.tar.gz"],
+        )
+
+        # a re-run must land the same files, not copies: the unpacker renames
+        # collisions, so extracting into a populated folder doubles the input
+        again = os.path.join(tmp, "again")
+        os.makedirs(again)
+        make_zip(os.path.join(again, "pack.zip"), {"a.png": b"a", "b.png": b"b"})
+        dearchive(again)
+        dearchive_path = os.path.join(again, "pack")
+        checks.eq("first unpack lands both files", sorted(os.listdir(dearchive_path)), ["a.png", "b.png"])
+        make_zip(os.path.join(again, "pack.zip"), {"a.png": b"a", "b.png": b"b"})
+        dearchive(again)
+        checks.eq("unpacking again does not duplicate", sorted(os.listdir(dearchive_path)), ["a.png", "b.png"])
+        checks.eq("…and leaves no staging folder", [n for n in os.listdir(again) if n.endswith(".part")], [])
         checks.true("the source archive is gone", not os.path.exists(os.path.join(room, "pack.zip")))
         checks.true("nested archive unpacked in place", os.path.isfile(os.path.join(room, "pack", "data", "inner", "img.png")))
 
@@ -103,7 +127,7 @@ def main() -> int:
         job_nodes = [{"type": "upscale", "options": {"model": "4x_d"}}]
         recorder = Recorder()
         tracker = ProgressTracker(recorder, request_id=7)
-        windows, head = preprocess_windows(preprocess)
+        windows = preprocess_windows(preprocess)
         cancel = asyncio.Event()
 
         async def run() -> bool:
@@ -111,7 +135,7 @@ def main() -> int:
 
         checks.true("preprocessors finish", asyncio.run(run()))
         checks.eq("both stages are reported", sorted(set(recorder.stages)), ["download", "unarchive"])
-        checks.eq("the bar stops at the head share", tracker.percent, head)
+        checks.eq("the bar ends full when the preprocessors are through", tracker.percent, 100.0)
         download_frames = [frame for frame in recorder.frames if frame["stage"] == "download"]
         checks.true("download reports bytes", any(frame.get("bytes_done", 0) > 0 for frame in download_frames))
         checks.eq("download is labelled with the model", download_frames[0]["label"], "4x_d")

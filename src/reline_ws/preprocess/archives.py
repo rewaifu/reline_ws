@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Callable
 
@@ -29,8 +30,12 @@ ARCHIVE_SUFFIXES = {
     ".lzma",
 }
 
-#: called with the archive that is about to be unpacked
-StepCallback = Callable[[str], None]
+#: `on_step(name, finished)`: the archive that is being unpacked right now, and
+#: whether it is through. Announcing the name at the start is what labels a long
+#: extraction; counting it at the end is what keeps the bar honest — a counter
+#: that ticks before `extract` returns parks the bar at 100 % for as long as the
+#: unpack really takes.
+StepCallback = Callable[[str, bool], None]
 
 
 def is_archive(path: str) -> bool:
@@ -65,10 +70,36 @@ def count_archives(target: str) -> int:
     )
 
 
+def _merge(source: str, target: str) -> None:
+    """Move everything under `source` into `target`, overwriting by name."""
+    for entry in os.listdir(source):
+        src = os.path.join(source, entry)
+        dst = os.path.join(target, entry)
+        if os.path.isdir(src):
+            os.makedirs(dst, exist_ok=True)
+            _merge(src, dst)
+        else:
+            os.replace(src, dst)
+
+
 def extract(archive: str, outdir: str) -> None:
-    """Unpack one archive into `outdir` (created if needed)."""
+    """Unpack one archive into `outdir`, replacing what is already there.
+
+    Extracting straight into a folder that already holds the same names is not
+    overwriting: the unpacker appends `_1` to every collision, so a second run
+    of the same config doubled its own input (220 images became 440, then 880)
+    and the reader happily processed the copies. A staging folder plus a
+    name-for-name merge makes the step idempotent — a re-run, or the replayed
+    `start` of a reconnected client, lands the same files in the same place.
+    """
+    staging = f"{outdir}.part"
+    shutil.rmtree(staging, ignore_errors=True)
+    patoolib.extract_archive(archive, outdir=staging, verbosity=-1)
+    # the merge starts only once the archive is fully out, so `outdir` never
+    # shows a half-extracted tree
     os.makedirs(outdir, exist_ok=True)
-    patoolib.extract_archive(archive, outdir=outdir, verbosity=-1)
+    _merge(staging, outdir)
+    shutil.rmtree(staging, ignore_errors=True)
 
 
 def _dearchive_folder(folder: str, on_step: StepCallback | None) -> None:
@@ -83,8 +114,10 @@ def _dearchive_folder(folder: str, on_step: StepCallback | None) -> None:
                 continue
             outdir = os.path.join(folder, base)
             if on_step is not None:
-                on_step(entry)
+                on_step(entry, False)
             extract(obj, outdir)
+            if on_step is not None:
+                on_step(entry, True)
             _dearchive_folder(outdir, on_step)
             os.remove(obj)
 
@@ -100,7 +133,9 @@ def dearchive(target: str, on_step: StepCallback | None = None) -> None:
         raise ValueError(f"unarchive: cannot derive a folder name from {target!r}")
     outdir = os.path.join(parent, base)
     if on_step is not None:
-        on_step(os.path.basename(target))
+        on_step(os.path.basename(target), False)
     extract(target, outdir)
+    if on_step is not None:
+        on_step(os.path.basename(target), True)
     _dearchive_folder(outdir, on_step)
     os.remove(target)

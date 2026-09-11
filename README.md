@@ -105,6 +105,24 @@ must not buffer or time out mid-run. In order:
 The client sends `echo` every 5 s and gives up after 15 s of silence, so any
 idle timeout the proxy applies is reset by traffic.
 
+### When the tab goes away
+
+A client that vanishes mid-run (closed tab, dropped tunnel, restarted proxy) is
+an ordinary event, not a crash. The first failed write marks the connection
+dead, wakes the cancel event so the pipeline stops at its next checkpoint, and
+turns every later frame into a no-op. The log gets one line and nothing else:
+
+```
+INFO:     client disconnected: cancelling the run (write failed: WebSocketDisconnect)
+```
+
+No `pipeline error` traceback — a dead socket is not a broken pipeline — and no
+`done` frame to a socket nobody is reading. The busy gate is released as soon as
+the run unwinds, so the client that reconnects can press start again instead of
+collecting `worker busy` for the rest of the abandoned batch. A *real* failure
+on a live socket is still loud: traceback in the log, `done {ok: false, error}`
+on the wire.
+
 ### Reading the public answer
 
 Two commands, one on the server and one outside, place the fault:

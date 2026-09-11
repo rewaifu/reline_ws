@@ -75,9 +75,12 @@ def _run_download(state: StepState, models_dir: str, nodes: list[dict], options:
 def _run_unarchive(state: StepState, target: str) -> None:
     state.total = count_archives(target)
 
-    def on_archive(name: str) -> None:
-        state.done += 1
+    def on_archive(name: str, finished: bool) -> None:
+        # the name labels the unpack while it runs; the counter only moves once
+        # the archive is actually out (see `StepCallback`)
         state.label = name
+        if finished:
+            state.done += 1
 
     dearchive(target, on_archive)
     # nested archives can push the total up while we unpack

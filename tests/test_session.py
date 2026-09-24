@@ -1,4 +1,4 @@
-"""Connection routing: envelope handling, ls, presets, start/stop contracts."""
+"""Connection routing: envelope handling, ls, presets, run sessions."""
 
 from __future__ import annotations
 
@@ -12,10 +12,10 @@ from typing import Any
 from _harness import Checks, finish
 
 from reline_ws.gate import BusyGate
-from reline_ws.handlers import run as run_handler
 from reline_ws.handlers.configs import config_path
 from reline_ws.handlers.fs import list_directory, parse_extensions
 from reline_ws.protocol import E_ECHO, E_ERROR, E_LS, FrameError, done_payload, pack, unpack
+from reline_ws.runs import BusyError
 from reline_ws.session import Connection
 from starlette.websockets import WebSocketDisconnect
 
@@ -58,6 +58,11 @@ class DeadSocket(FakeSocket):
 def make_connection() -> tuple[Connection, FakeSocket]:
     socket = FakeSocket()
     return Connection(socket, BusyGate()), socket
+
+
+#: a config the job can actually finish (unknown preprocessors are skipped,
+#: an empty image loop over zero steps is a success) without touching images
+QUICK = {"nodes": [], "preprocess": [{"type": "wat", "options": {}}]}
 
 
 async def scenario(checks: Checks, tmp: str) -> None:
@@ -142,50 +147,102 @@ async def scenario(checks: Checks, tmp: str) -> None:
     checks.eq("preset delete answers ok", (socket.last["m"], socket.last["id"]), ("ok", 15))
     checks.true("…and the file is gone", not os.path.exists(os.path.join(tmp, "configs", "b.json")))
 
-    # -- start / stop contracts ----------------------------------------
+    # -- start validation ----------------------------------------------
     await conn.dispatch({"m": "start", "id": 16, "d": {}})
     checks.eq("start without a pipeline is refused", socket.last["d"]["message"], "pipeline required")
-    checks.eq("…and the gate stays free", conn.gate.busy, False)
+    checks.eq("…and no run exists", conn.registry.current(), None)
 
     await conn.dispatch({"m": "start", "id": 17, "d": {"pipeline": {"nodes": "nope"}}})
     checks.true("a broken config is refused", socket.last["d"]["message"].startswith("invalid pipeline config"))
-    checks.eq("…and the gate is still free", conn.gate.busy, False)
+    checks.eq("…and the server is still free", conn.registry.current(), None)
 
-    conn.gate.acquire()
-    await conn.dispatch({"m": "start", "id": 18, "d": {"pipeline": {"nodes": []}}})
-    checks.eq("a second run is refused", socket.last["d"]["message"], "worker busy")
-    conn.gate.release()
+    # -- one run, two watchers ------------------------------------------
+    await conn.dispatch({"m": "start", "id": 18, "d": {"pipeline": QUICK}})
+    accepted = socket.last
+    checks.eq("a run is accepted", accepted["m"], "accepted")
+    run_id = accepted["d"].get("run_id")
+    checks.true("…with a run_id", isinstance(run_id, str) and bool(run_id))
+    checks.eq("…and the registry holds it", conn.registry.current() is not None and conn.registry.current().run_id, run_id)
 
-    conn.phase = "running"
-    await conn.dispatch({"m": "start", "id": 19, "d": {"pipeline": {"nodes": []}}})
-    checks.eq("start while running is refused", socket.last["d"]["message"], "запуск уже идёт")
-    conn.phase = "idle"
+    await conn.dispatch({"m": "start", "id": 19, "d": {"pipeline": QUICK}})
+    checks.eq("start while owning a run is refused", socket.last["d"]["message"], "запуск уже идёт")
 
-    await conn.dispatch({"m": "stop", "id": 20, "d": {}})
-    checks.eq("stop answers ok", (socket.last["m"], socket.last["id"]), ("ok", 20))
-    checks.true("…and raises the cancel flag", conn.cancel_event.is_set())
+    # a second connection shares the registry, like two sockets of one server
+    watcher = Connection(FakeSocket(), conn.gate, registry=conn.registry)
+    await watcher.dispatch({"m": "start", "id": 20, "d": {"pipeline": QUICK}})
+    busy = watcher.ws.last
+    checks.eq("a second run is refused", busy["d"]["message"], "worker busy")
+    checks.eq("…naming the run in flight", busy["d"].get("run_id"), run_id)
 
-    # -- job finish is always a released gate --------------------------
-    conn.gate.acquire()
-    conn.phase = "running"
-    conn.finish_run()
-    checks.eq("finish_run frees the gate", conn.gate.busy, False)
-    checks.eq("…and the connection is idle again", conn.phase, "idle")
+    await watcher.dispatch({"m": "status", "id": 21, "d": {}})
+    naming = watcher.ws.last
+    checks.eq("status without id names the active run", (naming["m"], naming["d"]["run_id"]), ("status", run_id))
+    checks.eq("…as running", naming["d"]["status"], "running")
 
-    stored = done_payload(ok=False, error="boom")
-    checks.eq("done payload carries the failure", (stored["ok"], stored["error"]), (False, "boom"))
+    await watcher.dispatch({"m": "attach", "id": 22, "d": {"run_id": run_id}})
+    attached = watcher.ws.last
+    checks.eq("attach answers attached", attached["m"], "attached")
+    checks.eq("…to the same run", attached["d"]["run_id"], run_id)
 
-    # -- the client vanishes mid-run -----------------------------------
+    record = conn.registry.current()
+    assert record is not None and record.task is not None
+    await record.task
+    starter_done = [frame for frame in socket.of("done")]
+    watcher_done = [frame for frame in watcher.ws.of("done")]
+    checks.eq("the starter gets its done", len(starter_done), 1)
+    checks.eq("…and so does the attacher", len(watcher_done), 1)
+    checks.eq("…successful", (starter_done[0]["d"]["ok"], watcher_done[0]["d"]["ok"]), (True, True))
+    checks.eq("…carrying the run_id", starter_done[0]["d"].get("run_id"), run_id)
+    checks.eq("every watcher keeps its own envelope id", (starter_done[0]["id"], watcher_done[0]["id"]), (18, 22))
+    checks.eq("the server is free again", conn.registry.current(), None)
+
+    await watcher.dispatch({"m": "status", "id": 23, "d": {"run_id": run_id}})
+    retained = watcher.ws.last
+    checks.eq("a finished run still answers status", (retained["m"], retained["d"]["status"]), ("status", "done"))
+    checks.eq("…with its result", retained["d"]["result"]["ok"], True)
+
+    await conn.dispatch({"m": "status", "id": 24, "d": {"run_id": "nope"}})
+    checks.eq("an unknown run_id is an error", (socket.last["m"], "unknown run_id" in socket.last["d"]["message"]), ("error", True))
+    await conn.dispatch({"m": "attach", "id": 25, "d": {"run_id": "nope"}})
+    checks.eq("…for attach too", socket.last["m"], "error")
+    fresh = Connection(FakeSocket(), BusyGate())
+    await fresh.dispatch({"m": "attach", "id": 26, "d": {}})
+    checks.eq("attach with no active run is an error", fresh.ws.last["d"]["message"], "no active run")
+    await fresh.dispatch({"m": "status", "id": 27, "d": {}})
+    checks.eq("…while status without runs is idle", (fresh.ws.last["m"], fresh.ws.last["d"]["status"]), ("status", "idle"))
+
+    # -- stop ------------------------------------------------------------
+    stopper, stop_socket = make_connection()
+    live = stopper.registry.start(40)
+    stopper.owned = live.run_id
+    stopper.registry.attach(stopper, live, 40)
+    await stopper.dispatch({"m": "stop", "id": 41, "d": {}})
+    checks.eq("stop answers ok", (stop_socket.last["m"], stop_socket.last["id"]), ("ok", 41))
+    checks.true("…and raises the run's cancel flag", live.cancel_event.is_set())
+    stopper.registry.finish(live, "cancelled", done_payload(ok=False, cancelled=True))
+    checks.eq("…and the server is free", stopper.registry.current(), None)
+
+    idle_conn, idle_socket = make_connection()
+    await idle_conn.dispatch({"m": "stop", "id": 42, "d": {}})
+    checks.eq("stop with nothing running still answers ok", idle_socket.last["m"], "ok")
+
+    # -- the client vanishes mid-run: the run survives --------------------
     dead = DeadSocket()
     gone = Connection(dead, BusyGate())
     checks.eq("a healthy send reports success", await Connection(FakeSocket(), BusyGate()).send({"m": "echo", "id": 30, "d": {}}), True)
+    survivor = gone.registry.start(31)
+    gone.owned = survivor.run_id
+    gone.registry.attach(gone, survivor, 31)
     checks.eq("the first failed write reports the dead socket", await gone.send({"m": "progress", "id": 31, "d": {}}), False)
     checks.eq("…and marks the connection closed", gone.closed, True)
-    checks.eq("…so the run is cancelled at its next checkpoint", gone.cancel_event.is_set(), True)
-    await gone.send_event("progress", {"percent": 2})
-    checks.eq("…never reaching the transport again", dead.writes, 1)
+    checks.eq("…which forgot the run", (gone.owned, gone.follow), (None, {}))
+    checks.eq("…but the run itself is still active", gone.registry.current() is survivor, True)
+    checks.eq("…still marked running", survivor.status, "running")
+    checks.true("…its cancel flag untouched", not survivor.cancel_event.is_set())
     await gone.shutdown()
     checks.eq("shutdown after a dead write stays quiet", gone.closed, True)
+    gone.registry.finish(survivor, "cancelled", done_payload(ok=False, cancelled=True))
+    checks.eq("…and the server is free once the run ends", gone.registry.current(), None)
 
     # a serialization bug is not a disconnect: it must still be loud
     alive = Connection(FakeSocket(), BusyGate())
@@ -200,26 +257,37 @@ async def scenario(checks: Checks, tmp: str) -> None:
     shutdown_conn = Connection(FakeSocket(), BusyGate())
     await shutdown_conn.shutdown()
     checks.eq("shutdown closes the connection for good", shutdown_conn.closed, True)
-    checks.eq("…and raises the cancel flag", shutdown_conn.cancel_event.is_set(), True)
 
-    # -- an abandoned run reports nothing, and frees the server --------
-    dead_conn = Connection(DeadSocket(), BusyGate())
-    dead_conn.gate.acquire()
-    dead_conn.phase = "running"
-    dead_conn.mark_closed()
-    await run_handler._run_job(dead_conn, 33, [], [], tmp)
-    checks.eq("an abandoned run writes no frames at all", dead_conn.ws.frames, [])
-    checks.eq("…and still frees the gate", dead_conn.gate.busy, False)
-    checks.eq("…leaving the connection idle", dead_conn.phase, "idle")
+    # -- broadcast: dead watchers leave, live ones stay --------------------
+    pub_conn, pub_socket = make_connection()
+    pub_record = pub_conn.registry.start(50)
+    pub_conn.registry.attach(pub_conn, pub_record, 50)
+    lurker = Connection(DeadSocket(), pub_conn.gate, registry=pub_conn.registry)
+    pub_conn.registry.attach(lurker, pub_record, 51)
+    await pub_conn.registry.publish(pub_record, "progress", {"percent": 10})
+    checks.eq("the dead watcher was dropped", sorted(pub_record.holders), sorted([id(pub_conn)]))
+    outcome = done_payload(ok=True)
+    outcome["run_id"] = pub_record.run_id
+    # Terminal frame first: `finish` unsubscribes the watchers, so publishing
+    # after it would deliver `done` to nobody.
+    await pub_conn.registry.publish(pub_record, "done", dict(outcome))
+    checks.eq("…which still reaches the live watcher", pub_socket.last["m"], "done")
+    pub_conn.registry.finish(pub_record, "done", outcome)
+    checks.eq("finish frees the server", pub_conn.registry.current(), None)
+    # -- registry races ----------------------------------------------------
+    gate_conn, _ = make_connection()
+    first = gate_conn.registry.start(60)
+    raised_busy = ""
+    try:
+        gate_conn.registry.start(61)
+    except BusyError as exc:
+        raised_busy = str(exc)
+    checks.eq("a second registry start raises BusyError", raised_busy, "worker busy")
+    gate_conn.registry.abort(first)
+    checks.eq("abort frees the gate without retaining", (gate_conn.registry.current(), gate_conn.registry.retained()), (None, None))
 
-    live_conn, live_socket = make_connection()
-    live_conn.gate.acquire()
-    live_conn.phase = "running"
-    live_conn.run_id = 34
-    await run_handler._run_job(live_conn, 34, [], [], tmp)
-    checks.eq("a failure with a live socket still reports done", live_socket.last["m"], "done")
-    checks.eq("…as ok:false", live_socket.last["d"]["ok"], False)
-    checks.true("…with a message", bool(live_socket.last["d"]["error"]))
+    stored = done_payload(ok=False, error="boom")
+    checks.eq("done payload carries the failure", (stored["ok"], stored["error"]), (False, "boom"))
 
 
 def main() -> int:

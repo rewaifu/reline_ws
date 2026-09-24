@@ -108,20 +108,21 @@ idle timeout the proxy applies is reset by traffic.
 ### When the tab goes away
 
 A client that vanishes mid-run (closed tab, dropped tunnel, restarted proxy) is
-an ordinary event, not a crash. The first failed write marks the connection
-dead, wakes the cancel event so the pipeline stops at its next checkpoint, and
-turns every later frame into a no-op. The log gets one line and nothing else:
+an ordinary event, not a crash. The first failed write unsubscribes the
+connection; the run keeps going detached and keeps the busy gate. The log gets
+one line and nothing else:
 
 ```
-INFO:     client disconnected: cancelling the run (write failed: WebSocketDisconnect)
+INFO:     client detached: run continues (write failed: WebSocketDisconnect)
 ```
 
 No `pipeline error` traceback — a dead socket is not a broken pipeline — and no
-`done` frame to a socket nobody is reading. The busy gate is released as soon as
-the run unwinds, so the client that reconnects can press start again instead of
-collecting `worker busy` for the rest of the abandoned batch. A *real* failure
-on a live socket is still loud: traceback in the log, `done {ok: false, error}`
-on the wire.
+`done` frame to a socket nobody is reading. The outcome is retained for 5
+minutes, so a client that dropped at 99 % can still read it via
+`status {run_id}`. A reconnect is `status` → `attach {run_id}`, never a second
+`start`: while the old run lives, a repeat earns `worker busy {run_id}` naming
+the run to attach to. A *real* failure on a live socket is still loud:
+traceback in the log, `done {ok: false, error}` on the wire.
 
 ### Reading the public answer
 
@@ -152,6 +153,7 @@ app.py                     uvicorn entry point (thin shim over the package)
 src/reline_ws/
   server.py                FastAPI app, the single `/run` endpoint
   session.py               per-connection state + method routing table
+  runs.py                  server-wide run registry (attach/status, 5-min retain)
   protocol.py              envelope `{m, id, d}`: pack/unpack, payload builders
   progress.py              bar windows, stage/rate/ETA accounting, throttling
   pipeline.py              config split, node plan, the image loop
@@ -160,7 +162,7 @@ src/reline_ws/
     models.py              model install / download / archive search
     archives.py            patool extraction (recursive, safe ordering)
   handlers/
-    run.py                 start / stop and the run job
+    run.py                 start / stop / status / attach and the run job
     fs.py                  ls (path autocompletion)
     configs.py             config_list / config_read / config_delete
   gate.py                  the exclusive-run gate

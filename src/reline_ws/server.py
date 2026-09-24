@@ -17,6 +17,7 @@ from . import __version__, patches
 from .gate import BusyGate
 from .pipeline import resolve_path
 from .protocol import E_ERROR, FrameError, error_payload, unpack
+from .runs import RunRegistry
 from .session import Connection
 
 logger = logging.getLogger("uvicorn.error")
@@ -38,6 +39,7 @@ def create_app(
     patches.apply()
     app = FastAPI(title="reline_ws", version=__version__)
     busy_gate = gate if gate is not None else BusyGate()
+    registry = RunRegistry(busy_gate)
     raw_root = root if root is not None else os.environ.get("RELINE_ROOT")
     raw_models = (
         models_dir
@@ -58,6 +60,8 @@ def create_app(
         and the WebSocket trouble is in the proxy's upgrade path instead.
         The path bases are part of the answer: "which folder does this
         deployment read from" is the first question when a run finds nothing.
+        `run_id` names the run in flight, so a client that lost its socket
+        can re-attach instead of guessing.
         """
         return {
             "ok": True,
@@ -65,6 +69,7 @@ def create_app(
             "busy": busy_gate.busy,
             "root": default_root,
             "models": default_models,
+            "run_id": registry.current().run_id if registry.current() is not None else None,
         }
 
     @app.websocket("/run")
@@ -75,6 +80,7 @@ def create_app(
             busy_gate,
             root=default_root,
             models_dir=default_models,
+            registry=registry,
         )
         try:
             while True:

@@ -1,10 +1,14 @@
 """Per-connection state machine for the WS_API.md protocol.
 
-One connection = one request/response channel plus at most one run. The
-receive loop hands frames to `dispatch`, which is a pure routing table: the
-handlers live in `handlers/` and every blocking thing they do (filesystem,
-network, the pipeline itself) happens in a worker thread or a task, so the
-socket keeps answering `echo` while work is in flight.
+One connection = one request/response channel plus subscriptions to runs.
+The receive loop hands frames to `dispatch`, which is a pure routing table:
+the handlers live in `handlers/` and every blocking thing they do
+(filesystem, network, the pipeline itself) happens in a worker thread or a
+task, so the socket keeps answering `echo` while work is in flight.
+
+Runs outlive the connection that started them (`runs.py`): a socket that
+dies only unsubscribes its watchers, and the client re-attaches by `run_id`
+instead of repeating `start`.
 """
 
 from __future__ import annotations
@@ -13,24 +17,26 @@ import asyncio
 import logging
 import os
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
-
 from .gate import BusyGate
 from .handlers import configs, fs, run
 from .protocol import (
     E_ECHO,
     E_ERROR,
+    M_ATTACH,
     M_CONFIG_DELETE,
     M_CONFIG_LIST,
     M_CONFIG_READ,
     M_ECHO,
     M_LS,
     M_START,
+    M_STATUS,
     M_STOP,
     error_payload,
     event,
     pack,
 )
 from .pipeline import resolve_path
+from .runs import RunRegistry
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
@@ -44,6 +50,8 @@ Handler = Callable[["Connection", int, dict[str, Any]], Awaitable[None]]
 ROUTES: dict[str, Handler] = {
     M_START: run.handle_start,
     M_STOP: run.handle_stop,
+    M_STATUS: run.handle_status,
+    M_ATTACH: run.handle_attach,
     M_LS: fs.handle_ls,
     M_CONFIG_LIST: configs.handle_list,
     M_CONFIG_READ: configs.handle_read,
@@ -59,9 +67,13 @@ class Connection:
         *,
         root: str | None = None,
         models_dir: str | None = None,
+        registry: RunRegistry | None = None,
     ) -> None:
         self.ws = ws
         self.gate = gate
+        #: the server-wide runs; created here when the caller did not hand one
+        #: over (unit tests), shared by every connection on a real server
+        self.registry = registry if registry is not None else RunRegistry(gate)
         #: launch-time bases (`RELINE_ROOT` / `RELINE_MODELS_DIR`): a run may
         #: override them, but a deployment sets them once and the UI never has
         #: to know where the data lives. `--models weights` under
@@ -71,12 +83,14 @@ class Connection:
             resolve_path(models_dir, self.root) if models_dir else None
         )
         self.models_dir: str | None = None
-        self.phase = "idle"
         self.configs_dir: str | None = None
-        #: request id of the current run: every run event carries it
-        self.run_id = 0
-        self.cancel_event = asyncio.Event()
-        self.job_task: asyncio.Task[None] | None = None
+        #: run_id -> request id: runs this connection watches. Every run event
+        #: is delivered with the watching connection's own request id, so two
+        #: tabs attached to one run do not share envelope ids.
+        self.follow: dict[str, int] = {}
+        #: the run this connection started, while it is still active: a second
+        #: `start` on the same socket is a user error, not a second job
+        self.owned: str | None = None
         self._send_lock = asyncio.Lock()
         #: the socket is gone (closed tab, dropped tunnel). Set by the first
         #: failed write or by `shutdown`; every send after that is a no-op.
@@ -89,13 +103,12 @@ class Connection:
         next to request replies) from interleaving partial frames.
 
         Returns False once the socket is gone. A failed write is news about
-        the client, not a server error: it marks the connection closed, wakes
-        the cancel event so the run unwinds at its next checkpoint, and makes
-        every later frame a no-op — instead of a `WebSocketDisconnect` traceback
-        raised from inside the progress reporter, which then masqueraded as a
-        pipeline crash and had the job try to report its failure to a socket
-        that was already dead. `pack` stays outside the guard: a serialization
-        bug is still a bug and must not be mistaken for a disconnect.
+        the client, not a server error: it marks the connection closed and
+        unsubscribes it from every run — the runs themselves keep going
+        detached, so a client that dropped its network can `attach` by
+        `run_id` and keep watching. `pack` stays outside the guard: a
+        serialization bug is still a bug and must not be mistaken for a
+        disconnect.
         """
         if self.closed:
             return False
@@ -111,29 +124,26 @@ class Connection:
         return True
 
     def mark_closed(self, exc: BaseException | None = None) -> None:
-        """The socket is gone: stop sending, stop the run.
+        """The socket is gone: stop sending, stop watching.
 
-        Cancelling here and not only in `shutdown` matters because a send is
+        Detaching here and not only in `shutdown` matters because a send is
         often the first thing to notice: the receive loop is parked in
-        `receive_bytes` while the job streams progress, so without this the
-        pipeline would keep processing images nobody will ever see and hold the
-        busy gate — "worker busy" for whoever reconnects next — for the whole
-        run instead of one checkpoint.
+        `receive_bytes` while the job streams progress, so without this a
+        dead watcher would accumulate in the run's holder list. The run is
+        deliberately NOT cancelled — a sleeping tab is not a stop request.
         """
         if self.closed:
             return
         self.closed = True
-        self.cancel_event.set()
+        self.registry.detach(self)
+        self.owned = None
         logger.info(
-            "client disconnected: cancelling the run%s",
+            "client detached: run continues%s",
             f" (write failed: {type(exc).__name__})" if exc is not None else "",
         )
 
     async def reply(self, request_id: int, method: str, d: dict[str, Any] | None = None) -> None:
         await self.send(event(method, request_id, d))
-
-    async def send_event(self, method: str, d: dict[str, Any] | None = None) -> None:
-        await self.send(event(method, self.run_id, d))
 
     # -- run state -------------------------------------------------------
 
@@ -165,22 +175,10 @@ class Connection:
             self.configs_dir = resolve_path(raw, self.root)
             os.makedirs(self.configs_dir, exist_ok=True)
 
-    def finish_run(self) -> None:
-        """The job is over: whatever it ended with, the server is free."""
-        self.gate.release()
-        self.phase = "idle"
-        self.job_task = None
-
     async def shutdown(self) -> None:
-        """Socket is going away: stop the run and wait for it to unwind, so
-        the busy gate is released before the next connection arrives."""
+        """Socket is going away: unsubscribe and close. The run (if any) keeps
+        going detached — whoever owned the tab re-attaches by `run_id`."""
         self.mark_closed()
-        task = self.job_task
-        if task is not None and not task.done():
-            try:
-                await task
-            except Exception:
-                logger.debug("job failed while the connection was closing", exc_info=True)
         try:
             await self.ws.close()
         except Exception:

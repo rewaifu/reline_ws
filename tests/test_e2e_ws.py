@@ -92,12 +92,13 @@ def read_log(path: str) -> str:
 ABANDON_IMAGES = 240
 
 
-async def abandon(checks: Checks, tmp: str, endpoint: str, log_path: str) -> None:
-    """The tab closes mid-run (the case that used to print a `pipeline error`
-    traceback): the server must read it as a disconnect, stop the batch and
-    free itself for the client that reconnects."""
-    source = os.path.join(tmp, "abandon_in")
-    target = os.path.join(tmp, "abandon_out")
+async def resume(checks: Checks, tmp: str, endpoint: str, log_path: str) -> None:
+    """The tab closes mid-run and comes back: the run keeps going detached,
+    and a fresh socket re-attaches by `run_id` instead of repeating `start`.
+    A blind repeat is refused with `worker busy {run_id}` — that is what tells
+    the client which run to attach to."""
+    source = os.path.join(tmp, "resume_in")
+    target = os.path.join(tmp, "resume_out")
     make_images(source, ABANDON_IMAGES)
     ws = await websockets.connect(endpoint, max_size=None)
     await send(
@@ -116,7 +117,10 @@ async def abandon(checks: Checks, tmp: str, endpoint: str, log_path: str) -> Non
             },
         },
     )
-    checks.eq("the abandoned run starts", (await read_frame(ws))["m"], "accepted")
+    accepted = await read_frame(ws)
+    checks.eq("the run starts", accepted["m"], "accepted")
+    run_id = accepted["d"].get("run_id")
+    checks.true("…with a run_id", isinstance(run_id, str) and bool(run_id))
     await read_frame(ws)  # real work is in flight now
     transport = getattr(ws, "transport", None)
     if transport is not None:
@@ -125,51 +129,47 @@ async def abandon(checks: Checks, tmp: str, endpoint: str, log_path: str) -> Non
         await ws.close()
     checks.ok("the client vanished mid-run")
 
-    # a fresh connection must get the server back: `busy` means the abandoned
-    # run is still holding the gate
-    deadline = time.monotonic() + 20
-    while time.monotonic() < deadline:
+    # a fresh connection first asks what is going on, then watches the run
+    async with websockets.connect(endpoint, max_size=None) as probe:
+        await send(probe, {"m": "status", "id": 51, "d": {}})
+        status = await read_frame(probe)
+        checks.eq("status names the detached run", (status["m"], status["d"].get("run_id")), ("status", run_id))
+        checks.eq("…as still running", status["d"]["status"], "running")
+        checks.true("…with numbers to place the bar", isinstance(status["d"].get("progress"), dict))
+
+        # a blind repeat is refused — and names the run to attach to
+        await send(
+            probe,
+            {
+                "m": "start",
+                "id": 52,
+                "d": {
+                    "pipeline": pipeline(
+                        [
+                            {"type": "folder_reader", "options": {"path": source, "mode": "rgb", "recursive": False}},
+                            {"type": "level", "options": LEVEL_OPTIONS},
+                            {"type": "folder_writer", "options": {"path": target, "format": "png"}},
+                        ]
+                    )
+                },
+            },
+        )
+        busy = await read_frame(probe)
+        checks.eq("a repeat start is refused", (busy["m"], busy["d"]["message"]), ("error", "worker busy"))
+        checks.eq("…naming the run to attach to", busy["d"].get("run_id"), run_id)
+
+        await send(probe, {"m": "attach", "id": 53, "d": {"run_id": run_id}})
+        attached = await read_frame(probe)
+        checks.eq("attach is confirmed", (attached["m"], attached["d"].get("run_id")), ("attached", run_id))
         try:
-            async with websockets.connect(endpoint, max_size=None) as probe:
-                await send(
-                    probe,
-                    {
-                        "m": "start",
-                        "id": 51,
-                        "d": {
-                            "pipeline": pipeline(
-                                [
-                                    {"type": "folder_reader", "options": {"path": os.path.join(tmp, "in"), "mode": "rgb", "recursive": False}},
-                                    {"type": "level", "options": LEVEL_OPTIONS},
-                                    {"type": "folder_writer", "options": {"path": os.path.join(tmp, "after"), "format": "png"}},
-                                ]
-                            )
-                        },
-                    },
-                )
-                frame = await read_frame(probe)
-                if frame["m"] != "accepted":
-                    await asyncio.sleep(0.3)
-                    continue
-                checks.ok("a reconnect takes the server back without waiting for the batch")
-                try:
-                    await read_until_done(probe)
-                except Exception as exc:  # noqa: BLE001 - the server log says why
-                    raise AssertionError(
-                        f"the reconnect run failed: {exc!r}\n\n{read_log(log_path)[-2000:]}"
-                    ) from exc
-        except AssertionError:
-            raise
-        except Exception:  # noqa: BLE001 - reconnect races are expected here
-            await asyncio.sleep(0.3)
-            continue
-        break
-    else:
-        raise AssertionError(f"the server stayed busy after the client vanished\n\n{read_log(log_path)[-2000:]}")
+            frames = await read_until_done(probe)
+        except Exception as exc:  # noqa: BLE001 - the server log says why
+            raise AssertionError(f"the resumed run failed: {exc!r}\n\n{read_log(log_path)[-2000:]}") from exc
+        checks.eq("the resumed run finishes", frames[-1]["d"]["ok"], True)
+        checks.eq("…under the same run_id", frames[-1]["d"].get("run_id"), run_id)
 
     written = len(sorted(os.listdir(target)))
-    checks.true(f"…and the abandoned batch stopped early ({written} of {ABANDON_IMAGES})", written < ABANDON_IMAGES)
-
+    checks.eq("…and the detached batch ran to the end", written, ABANDON_IMAGES)
 
 async def scenario(checks: Checks, tmp: str, endpoint: str) -> None:
     source = os.path.join(tmp, "in")
@@ -418,7 +418,7 @@ def main() -> int:
     print("e2e ws:", flush=True)
     tmp = tempfile.mkdtemp(prefix="reline_ws_e2e_")
     port = free_port()
-    # the log goes to a file, not a pipe: `abandon` needs to read what the
+    # the log goes to a file, not a pipe: `resume` needs to read what the
     # server said *after* a checkpoint, and a pipe cannot be peeked at.
     log_path = os.path.join(tmp, "server.log")
     log_file = open(log_path, "w", encoding="utf-8")
@@ -468,10 +468,10 @@ def main() -> int:
         # Everything the deliberate failures above wrote is behind us: only what
         # the vanished client produces is read here.
         marker = len(read_log(log_path))
-        asyncio.run(abandon(checks, tmp, f"ws://127.0.0.1:{port}/run", log_path))
+        asyncio.run(resume(checks, tmp, f"ws://127.0.0.1:{port}/run", log_path))
         time.sleep(0.5)
         tail = read_log(log_path)[marker:]
-        checks.true("a vanished client is logged as a disconnect", "client disconnected" in tail)
+        checks.true("a vanished client is logged as detached", "client detached" in tail)
         checks.eq("…never as a pipeline error", "pipeline error" in tail, False)
     finally:
         server.terminate()

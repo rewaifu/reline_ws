@@ -1,12 +1,14 @@
 """Preprocessors: the part of a config that runs before the pipeline.
 
-Two kinds, both real (WS_API.md, «Препроцессоры»):
+Three kinds, all real (WS_API.md, «Препроцессоры»):
 
 * `download` — installs an upscale model into the run's model folder (the
   `models` base from `start`, `RELINE_MODELS_DIR` when absent) and repoints every
   upscale node that asked for it by name (see `models.py`);
 * `unarchive` — unpacks an archive, or a folder of archives, recursively
-  (see `archives.py`).
+  (see `archives.py`);
+* `cleandir` — empties a writer's output folder before the run, so stale files
+  from the previous run cannot mix with the new ones.
 
 Both are blocking file work, so each item runs in a worker thread while the
 event loop polls a small shared state for progress and cancellation. The
@@ -19,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 from dataclasses import dataclass
 from typing import Any
 
@@ -50,8 +53,10 @@ def _stage_of(item: dict[str, Any]) -> tuple[Stage, str]:
     if kind == "download":
         options = normalize_options(item.get("options"))
         return Stage.DOWNLOAD, str(options.get("name") or "download")
+    if kind == "cleandir":
+        options = normalize_options(item.get("options"))
+        return Stage.UNARCHIVE, os.path.basename(str(options.get("path") or "cleandir"))
     return Stage.UNARCHIVE, os.path.basename(str(normalize_options(item.get("options")).get("path") or "unarchive"))
-
 
 def _run_download(state: StepState, models_dir: str, nodes: list[dict], options: dict[str, Any]) -> None:
     name = str(options.get("name") or "").strip()
@@ -86,6 +91,27 @@ def _run_unarchive(state: StepState, target: str) -> None:
     # nested archives can push the total up while we unpack
     state.total = max(state.total, state.done)
 
+
+def _run_cleandir(state: StepState, target: str) -> None:
+    """Empty `target` in place: every entry inside goes, the folder itself
+    stays (the writer recreates what it needs). A missing folder is already
+    fine — nothing to clean. Anything that cannot be removed is logged and
+    left alone, never a run error."""
+    state.total = 1
+    state.label = os.path.basename(target) or target
+    if not os.path.isdir(target):
+        state.done = 1
+        return
+    for entry in os.listdir(target):
+        path = os.path.join(target, entry)
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+        except OSError as exc:
+            logger.warning("cleandir: cannot remove %s: %s", path, exc)
+    state.done = 1
 
 async def _run_step(
     tracker: ProgressTracker,
@@ -151,10 +177,10 @@ async def run_preprocessors(
             worker = lambda state, _o=options: _run_download(state, models_dir, nodes, _o)
         elif stage is Stage.UNARCHIVE:
             target = resolve_path(str(options.get("path") or ""), root)
-            worker = lambda state, _t=target: _run_unarchive(state, _t)
-        else:
-            logger.warning("unknown preprocess type %r, skipped", item.get("type"))
-            continue
+            if str(item.get("type")) == "cleandir":
+                worker = lambda state, _t=target: _run_cleandir(state, _t)
+            else:
+                worker = lambda state, _t=target: _run_unarchive(state, _t)
         keep_going = await _run_step(tracker, cancel_event, window, stage, label, worker)
         if not keep_going:
             return False

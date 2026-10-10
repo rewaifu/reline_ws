@@ -54,7 +54,7 @@ def main() -> int:
     checks.eq("…even with a trailing slash on root", resolve_path("/data", "/data/"), "/data")
     checks.eq("no root -> untouched", resolve_path("in", None), "in")
 
-    prepared, preprocess_left = PipelineWs.prepare_config(
+    prepared, preprocess_left, postprocess_left = PipelineWs.prepare_config(
         {
             "nodes": [
                 {"type": "folder_reader", "options": {"path": "in"}},
@@ -62,16 +62,27 @@ def main() -> int:
                 {"type": "folder_writer", "options": {"path": "out"}},
             ],
             "preprocess": [{"type": "download", "options": {"name": "x"}, "meta": {"disabled": True}}],
+            "postprocess": [
+                {
+                    "type": "psd_postprocess",
+                    "options": {"path": "out", "source_path": "in", "fit": "original", "delete_originals": False},
+                }
+            ],
         },
         "/data",
     )
     checks.eq("disabled nodes are dropped", [item["type"] for item in prepared], ["folder_reader", "folder_writer"])
     checks.eq("…and their preprocessors too", preprocess_left, [])
     checks.eq("reader path resolved against root", prepared[0]["options"]["path"], "/data/in")
+    checks.eq(
+        "postprocess section passes through with resolved paths",
+        [(item["type"], item["options"]["path"], item["options"]["source_path"]) for item in postprocess_left],
+        [("psd_postprocess", "/data/out", "/data/in")],
+    )
 
     # -- upscale `model`: a file or a download request -------------------
     def model_of(value: str, extra: dict[str, Any] | None = None) -> str:
-        prepared, _ = PipelineWs.prepare_config(
+        prepared, _, _ = PipelineWs.prepare_config(
             {"nodes": [{"type": "upscale", "options": {"model": value, **(extra or {})}}]},
             "/data",
         )
@@ -109,12 +120,20 @@ def main() -> int:
     raises_with("a chain without a writer is refused", "no writer", PipelineWs.build, [reader])
     raises_with("a chain without a reader is refused", "no reader", PipelineWs.build, [writer])
     raises_with(
-        "a reader folder that is not there is refused by name",
-        "not exist",
+        "a missing postprocess source folder is refused by name",
+        "postprocess source folder does not exist",
         PipelineWs.build,
+        [reader, writer],
         [
-            {"type": "folder_reader", "options": {"path": os.path.join(work, "nope")}},
-            writer,
+            {
+                "type": "psd_postprocess",
+                "options": {
+                    "path": target,
+                    "source_path": os.path.join(work, "nope"),
+                    "fit": "original",
+                    "delete_originals": False,
+                },
+            }
         ],
     )
     checks.eq("a reader with a writer passes", len(PipelineWs.build([reader, writer]).steps), 2)

@@ -14,6 +14,7 @@ MODULES = [
     "test_progress",
     "test_pipeline",
     "test_preprocess",
+    "test_postprocess",
     "test_session",
     "test_e2e_ws",
 ]

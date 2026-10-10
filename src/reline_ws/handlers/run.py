@@ -67,7 +67,7 @@ async def handle_start(conn: "Connection", request_id: int, d: dict[str, Any]) -
         return
     try:
         root = conn.resolve_root(d.get("root"))
-        nodes, preprocess = PipelineWs.prepare_config(raw_pipeline, root)
+        nodes, preprocess, postprocess = PipelineWs.prepare_config(raw_pipeline, root)
     except Exception as exc:
         logger.debug("invalid pipeline config: %s", exc)
         await conn.reply(request_id, E_ERROR, error_payload(f"invalid pipeline config: {exc}"))
@@ -92,7 +92,7 @@ async def handle_start(conn: "Connection", request_id: int, d: dict[str, Any]) -
     conn.registry.attach(conn, record, request_id)
     await conn.reply(request_id, E_ACCEPTED, {"run_id": record.run_id})
     record.task = asyncio.create_task(
-        _run_job(conn.registry, record, nodes, preprocess, models_dir, root)
+        _run_job(conn.registry, record, nodes, preprocess, postprocess, models_dir, root)
     )
 
 
@@ -152,6 +152,7 @@ async def _run_job(
     record: RunRecord,
     nodes: list[dict],
     preprocess: list[dict],
+    postprocess: list[dict],
     models_dir: str,
     root: str | None,
 ) -> None:
@@ -162,7 +163,7 @@ async def _run_job(
     cancelled = False
     error_text: str | None = None
     try:
-        if not nodes and not preprocess:
+        if not nodes and not preprocess and not postprocess:
             raise ValueError("pipeline is empty: nothing to do")
         # Two phases, two bars: the preprocessors fill the bar from 0 %, and
         # `begin_phase` resets it once they are through, so a long download
@@ -182,7 +183,7 @@ async def _run_job(
         if not cancelled:
             await tracker.begin_phase(Phase.PROCESS)
             read_window, image_window = pipeline_windows()
-            pipeline = PipelineWs.build(nodes)
+            pipeline = PipelineWs.build(nodes, postprocess)
             cancelled = not await pipeline.run(tracker, record.cancel_event, read_window, image_window)
         if not cancelled:
             await tracker.finish()

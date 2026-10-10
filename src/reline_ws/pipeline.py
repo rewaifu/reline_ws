@@ -35,7 +35,7 @@ from reline.pipeline import Pipeline
 from reline.static import Node
 
 from .progress import ProgressTracker, Stage, Window
-
+from .postprocess import natural_key, run_postprocess
 logger = logging.getLogger("uvicorn.error")
 
 READER_NODES = (FileReaderNode, FolderReaderNode)
@@ -107,6 +107,18 @@ def check_steps(steps: list["PlanStep"]) -> None:
             raise ValueError(f"reader folder does not exist: {path}")
 
 
+def check_postprocess(postprocess: list[dict]) -> None:
+    """Fail fast on a PSD background folder that is not there — same rule as
+    the reader folder: finishing green over zero PSDs reads as a dead tool."""
+    for item in postprocess:
+        if not isinstance(item, dict) or item.get("type") != "psd_postprocess":
+            continue
+        options = item.get("options")
+        source = options.get("source_path") if isinstance(options, dict) else None
+        if isinstance(source, str) and source and not os.path.isdir(source):
+            raise ValueError(f"postprocess source folder does not exist: {source}")
+
+
 #: what an installed model file looks like
 MODEL_SUFFIXES = (".pth", ".pt", ".safetensors")
 
@@ -150,20 +162,75 @@ def _is_disabled(item: Any) -> bool:
     return isinstance(meta, dict) and meta.get("disabled") is True
 
 
+async def run_postprocess_for(
+    tracker: ProgressTracker,
+    cancel_event: asyncio.Event,
+    window: Window,
+    writer: PlanStep,
+    postprocess: list[dict],
+) -> bool:
+    """PSD pass for one writer's output, from the `postprocess` section.
+
+    The writer claims its entry by output path (`path` == its own folder):
+    uids are reminted on every import, paths are the stable identity. No
+    entry, or no `source_path` on it — nothing to do. The pass owns no bar of
+    its own: it reuses the image window the chain just filled, so the run
+    reports one more `process` step instead of a new phase.
+    """
+    options = getattr(writer.node, "options", None)
+    output = getattr(options, "path", None)
+    if not isinstance(output, str) or not output:
+        return True
+    entry = next(
+        (
+            item.get("options")
+            for item in postprocess
+            if isinstance(item, dict)
+            and item.get("type") == "psd_postprocess"
+            and isinstance(item.get("options"), dict)
+            and item["options"].get("path") == output
+        ),
+        None,
+    )
+    if not isinstance(entry, dict):
+        return True
+    source = entry.get("source_path")
+    if not isinstance(source, str) or not source:
+        return True
+    return await run_postprocess(
+        tracker,
+        cancel_event,
+        window,
+        f"{writer.label} PSD",
+        output,
+        source,
+        str(entry.get("fit") or "original"),
+        bool(entry.get("delete_originals") or False),
+    )
+
 class PipelineWs:
     """A built pipeline plus the step plan the runner reports progress from."""
 
-    def __init__(self, steps: list[PlanStep]) -> None:
+    def __init__(self, steps: list[PlanStep], postprocess: list[dict] | None = None) -> None:
         self.steps = steps
+        self.postprocess = postprocess or []
 
     @classmethod
-    def prepare_config(cls, data: Any, root: str | None) -> tuple[list[dict], list[dict]]:
+    def prepare_config(
+        cls, data: Any, root: str | None
+    ) -> tuple[list[dict], list[dict], list[dict]]:
         """Split the config and resolve node paths against root. The pipeline
         itself is built later, AFTER the preprocessors ran — they rewrite
         options (upscale model paths) in place."""
         nodes, preprocess = split_config(data)
+        postprocess = (
+            data.get("postprocess") or [] if isinstance(data, dict) else []
+        )
+        if not isinstance(postprocess, list):
+            raise ValueError("postprocess must be a list")
         nodes = [item for item in nodes if not _is_disabled(item)]
         preprocess = [item for item in preprocess if not _is_disabled(item)]
+        postprocess = [item for item in postprocess if not _is_disabled(item)]
         for item in nodes:
             options = item.get("options") if isinstance(item, dict) else None
             if not isinstance(options, dict):
@@ -176,10 +243,19 @@ class PipelineWs:
             model = options.get("model")
             if isinstance(model, str) and looks_like_model_path(model):
                 options["model"] = resolve_path(model, root)
-        return nodes, preprocess
+        for item in postprocess:
+            options = item.get("options") if isinstance(item, dict) else None
+            if not isinstance(options, dict):
+                continue
+            # the PSD pass reads backgrounds from here and writes next to the
+            # output folder — same rule as the reader path, one root for both
+            for key in ("path", "source_path"):
+                if isinstance(options.get(key), str):
+                    options[key] = resolve_path(options[key], root)
+        return nodes, preprocess, postprocess
 
     @classmethod
-    def build(cls, nodes: list[dict]) -> PipelineWs:
+    def build(cls, nodes: list[dict], postprocess: list[dict] | None = None) -> PipelineWs:
         """Construct after the preprocessors ran (they may rewrite options)."""
         built = Pipeline.from_json(nodes).nodes
         steps = [
@@ -187,7 +263,8 @@ class PipelineWs:
             for item, node in zip(nodes, built)
         ]
         check_steps(steps)
-        return cls(steps)
+        check_postprocess(postprocess or [])
+        return cls(steps, postprocess or [])
 
     async def run(
         self,
@@ -226,6 +303,13 @@ class PipelineWs:
             if chain:
                 finished = await self._run_chain_group(
                     tracker, cancel_event, image_window, chain, data, total
+                )
+                if not finished:
+                    return False
+
+            if end <= total_steps and self.steps[end - 1].is_writer:
+                finished = await run_postprocess_for(
+                    tracker, cancel_event, image_window, self.steps[end - 1], self.postprocess
                 )
                 if not finished:
                     return False

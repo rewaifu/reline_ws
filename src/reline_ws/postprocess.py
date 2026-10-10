@@ -1,18 +1,17 @@
 """PSD postprocess: pair processed images with their sources, save layered PSDs.
 
 Runs after the main chain, inside the same `process` phase and bar: for every
-image the chain wrote, the matching source file is re-read as the background
-and the written file as the foreground, then `pepeline.compose_psd` saves a
-two-layer PSD into the `psd/` subfolder of the writer output.
+image the chain wrote, the written file is re-read as the background (it
+defines the canvas, so the processed result is never scaled or clipped) and
+the matching source file goes on top as the overlay, fitted per the node's
+`fit` method. The two-layer PSD lands in the `psd/` subfolder of the writer
+output.
 
 Pairing is by file stem (name without extension):
 
 1. images whose stem exists on both sides pair up first;
 2. leftovers pair in OS-like (natural) order — `img2` before `img10` — until
    either side runs out: a stem missing on either side is skipped quietly.
-
-The canvas comes from the source file, so the PSD keeps its size; the
-processed image is fitted onto it per the node's `fit` method.
 """
 
 import asyncio
@@ -106,9 +105,9 @@ class PostState:
 
 
 def _run_postprocess(
-    state: PostState, processed_dir: str, source_dir: str, fit: Any, delete_originals: bool = False
+    state: PostState, processed_dir: str, source_dir: str, fit_name: str, delete_originals: bool = False
 ) -> None:
-    compose_psd, _, ImgColor, ImgFormat, read = _pepeline()
+    compose_psd, overlay_fit, ImgColor, ImgFormat, read = _pepeline()
     processed = _collect_stems(processed_dir)
     if not processed:
         return
@@ -118,26 +117,39 @@ def _run_postprocess(
         return
     psd_dir = os.path.join(processed_dir, "psd")
     os.makedirs(psd_dir, exist_ok=True)
-    for stem, foreground_path, background_path in pairs:
+    # the binding's OverlayFit members are Capitalized (Fit, Cover, ...),
+    # the wire sends lowercase ("fit", "cover", ...) — index by name so an
+    # unknown value falls back to Original instead of raising mid-run
+    fit_by_name = {name.lower(): member for name, member in vars(overlay_fit).items() if not name.startswith("_")}
+    fit = fit_by_name.get(str(fit_name).lower(), overlay_fit.Original)
+    for stem, processed_path, original_path in pairs:
         try:
-            background = read(background_path, ImgColor.RGB, ImgFormat.U8)
-            foreground = read(foreground_path, ImgColor.RGB, ImgFormat.U8)
+            background = read(processed_path, ImgColor.RGB, ImgFormat.U8)
+            foreground = read(original_path, ImgColor.RGB, ImgFormat.U8)
+            # background (the processed file) defines the canvas: the
+            # processed result is never scaled or clipped, the source on
+            # top is fitted into it per the node's fit method. The fit box
+            # is the canvas itself — without it the binding passes 0x0 and
+            # any non-Original fit would crush the overlay to 1x1.
+            bh, bw = background.shape[0], background.shape[1]
             compose_psd(
                 background,
                 foreground,
                 os.path.join(psd_dir, f"{stem}.psd"),
                 fit=fit,
+                fit_width=bw,
+                fit_height=bh,
             )
         except Exception as exc:
             logger.warning("postprocess: %s skipped: %s", stem, exc)
             continue
         # the PSD now holds the layer: the flat file it was composed from can
-        # go when the node asked for it
+        # go when the node asked for it (the processed flat, never the source)
         if delete_originals:
             try:
-                os.remove(foreground_path)
+                os.remove(processed_path)
             except OSError as exc:
-                logger.warning("postprocess: cannot remove %s: %s", foreground_path, exc)
+                logger.warning("postprocess: cannot remove %s: %s", processed_path, exc)
         state.done += 1
 
 
@@ -154,10 +166,8 @@ async def run_postprocess(
     """Compose PSDs for one writer's output. Returns False when cancelled."""
     state = PostState()
     await tracker.open_stage(Stage.PROCESS, window, label=label, node="psd_compose")
-    _, overlay_fit, _, _, _ = _pepeline()
-    fit = getattr(overlay_fit, fit_name, overlay_fit.Original)
     task = asyncio.create_task(
-        asyncio.to_thread(_run_postprocess, state, processed_dir, source_dir, fit, delete_originals)
+        asyncio.to_thread(_run_postprocess, state, processed_dir, source_dir, fit_name, delete_originals)
     )
     while not task.done():
         await tracker.update(done=state.done, total=state.total)

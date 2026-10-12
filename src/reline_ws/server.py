@@ -8,13 +8,17 @@ the UI draws). This module only owns the socket lifecycle.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from . import __version__, patches
 from .gate import BusyGate
+from .modeldb import CACHE_NAME, DEFAULT_URL, ModelCatalog, default_cache_dir
 from .pipeline import resolve_path
 from .protocol import E_ERROR, FrameError, error_payload, unpack
 from .runs import RunRegistry
@@ -28,6 +32,8 @@ def create_app(
     root: str | None = None,
     models_dir: str | None = None,
     gate: BusyGate | None = None,
+    cache_dir: str | None = None,
+    model_db: ModelCatalog | None = None,
 ) -> FastAPI:
     """App factory.
 
@@ -35,9 +41,38 @@ def create_app(
     `RELINE_MODELS_DIR` (or the `--root` / `--models` flags of `app.py`) are how
     a machine says where its data and models live, so the UI only has to know
     the address. A run may still override either one in `start`.
+
+    `cache_dir` (`RELINE_CACHE_DIR`) is where the runner keeps what it fetched
+    for clients — today the model list. `RELINE_MODELS_DB_URL` overrides the
+    database address; an empty value switches the network off. `model_db` hands
+    in a ready catalog (tests).
     """
     patches.apply()
-    app = FastAPI(title="reline_ws", version=__version__)
+    raw_cache = cache_dir if cache_dir is not None else os.environ.get("RELINE_CACHE_DIR")
+    catalog = (
+        model_db
+        if model_db is not None
+        else ModelCatalog(
+            os.environ.get("RELINE_MODELS_DB_URL", DEFAULT_URL),
+            os.path.join(
+                os.path.abspath(raw_cache) if raw_cache else default_cache_dir(),
+                CACHE_NAME,
+            ),
+        )
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        # the last good copy is served at once; a fresh one is fetched behind it,
+        # so a slow or unreachable database never delays the runner starting
+        catalog.load_cache()
+        refreshing = asyncio.create_task(catalog.refresh())
+        try:
+            yield
+        finally:
+            refreshing.cancel()
+
+    app = FastAPI(title="reline_ws", version=__version__, lifespan=lifespan)
     busy_gate = gate if gate is not None else BusyGate()
     registry = RunRegistry(busy_gate)
     raw_root = root if root is not None else os.environ.get("RELINE_ROOT")
@@ -69,6 +104,7 @@ def create_app(
             "busy": busy_gate.busy,
             "root": default_root,
             "models": default_models,
+            "model_db": catalog.describe(),
             "run_id": registry.current().run_id if registry.current() is not None else None,
         }
 
@@ -81,6 +117,7 @@ def create_app(
             root=default_root,
             models_dir=default_models,
             registry=registry,
+            model_db=catalog,
         )
         try:
             while True:

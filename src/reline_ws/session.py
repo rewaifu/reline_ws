@@ -18,7 +18,8 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from .gate import BusyGate
-from .handlers import configs, fs, run
+from .handlers import configs, fs, model_db, run
+from .modeldb import ModelCatalog
 from .protocol import (
     E_ECHO,
     E_ERROR,
@@ -28,6 +29,7 @@ from .protocol import (
     M_CONFIG_READ,
     M_ECHO,
     M_LS,
+    M_MODELS,
     M_START,
     M_STATUS,
     M_STOP,
@@ -56,6 +58,7 @@ ROUTES: dict[str, Handler] = {
     M_CONFIG_LIST: configs.handle_list,
     M_CONFIG_READ: configs.handle_read,
     M_CONFIG_DELETE: configs.handle_delete,
+    M_MODELS: model_db.handle_models,
 }
 
 
@@ -68,9 +71,13 @@ class Connection:
         root: str | None = None,
         models_dir: str | None = None,
         registry: RunRegistry | None = None,
+        model_db: ModelCatalog | None = None,
     ) -> None:
         self.ws = ws
         self.gate = gate
+        #: the server-wide model list (`models` method); None in unit tests
+        #: that do not exercise it
+        self.model_db = model_db
         #: the server-wide runs; created here when the caller did not hand one
         #: over (unit tests), shared by every connection on a real server
         self.registry = registry if registry is not None else RunRegistry(gate)

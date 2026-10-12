@@ -61,6 +61,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         "RELINE_MODELS_DIR, then /content/models)",
     )
     parser.add_argument(
+        "--cache-dir",
+        default=os.environ.get("RELINE_CACHE_DIR"),
+        help="where the runner keeps what it fetched for clients (the model "
+        "list); default: RELINE_CACHE_DIR, then ~/.cache/reline_ws",
+    )
+    parser.add_argument(
         "--no-proxy-headers",
         action="store_true",
         help="ignore X-Forwarded-* (the default trusts a local reverse proxy)",
@@ -68,7 +74,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     uvicorn.run(
-        create_app(root=args.root, models_dir=args.models),
+        create_app(root=args.root, models_dir=args.models, cache_dir=args.cache_dir),
         host=args.host,
         port=args.port,
         proxy_headers=not args.no_proxy_headers,

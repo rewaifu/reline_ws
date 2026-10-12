@@ -23,6 +23,7 @@ M_ATTACH = "attach"
 M_CONFIG_LIST = "config_list"
 M_CONFIG_READ = "config_read"
 M_CONFIG_DELETE = "config_delete"
+M_MODELS = "models"
 
 # server -> client
 E_ACCEPTED = "accepted"
@@ -36,6 +37,7 @@ E_STATUS = "status"
 E_ATTACHED = "attached"
 E_CONFIG_LIST = "config_list"
 E_CONFIG_READ = "config_read"
+E_MODELS = "models"
 
 class FrameError(ValueError):
     """A frame that could not be decoded as an envelope."""

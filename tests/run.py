@@ -16,6 +16,7 @@ MODULES = [
     "test_preprocess",
     "test_postprocess",
     "test_session",
+    "test_modeldb",
     "test_e2e_ws",
 ]
 

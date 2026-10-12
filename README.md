@@ -24,13 +24,32 @@ Launch parameters — where this machine reads and writes:
 | `--models`  | `RELINE_MODELS_DIR`  | `/content/models` | where `download` installs models and installed ones are searched |
 | `--host`    | `RELINE_HOST`        | `0.0.0.0`         | interface to bind                                                |
 | `--port`    | `RELINE_PORT`        | `8000`            | port to bind                                                     |
+| `--cache-dir` | `RELINE_CACHE_DIR` | `~/.cache/reline_ws` | where the runner keeps what it fetched for clients (the model list) |
+| *(env only)* | `RELINE_MODELS_DB_URL` | `https://mdb.yor.ovh/v1/files` | the model database address; empty = no network, serve the disk copy only |
 | `--no-proxy-headers` | —           | off               | ignore `X-Forwarded-*` instead of trusting a local proxy         |
 
-`GET /health` reports them back (`"root"`, `"models"`), so which folder a
-deployment is using is one curl away.
+`GET /health` reports them back (`"root"`, `"models"`, and `"model_db"` — how
+many models are known, when they were fetched, the last error), so which folder
+a deployment is using is one curl away.
 
 One run at a time across all connections (GPU-bound work): a second `start`
 answers `error {"worker busy"}`.
+
+## Model list
+
+The list of downloadable upscale models comes from the model database
+(`https://mdb.yor.ovh/v1/files`). The **runner** fetches it, not the browser: whether
+that address is reachable depends on where the machine lives, and that should be a
+property of the deployment, not of whoever opens the UI.
+
+* at launch the last good copy is read from `<cache dir>/models-db.json` and a
+  refresh starts in the background (startup never waits for the database);
+* every good answer is written to disk atomically, so a restart without a network
+  still has a list;
+* the `models` method answers `{files, fetched_at, stale}`. A copy older than 10
+  minutes is refreshed first; `{"refresh": true}` asks for a fresh one (honoured at
+  most every 30 s); when the database cannot be reached the old copy is served with
+  `stale: true`, and with no copy at all the answer is an `error`.
 
 ## Path bases
 
@@ -153,6 +172,7 @@ app.py                     uvicorn entry point (thin shim over the package)
 src/reline_ws/
   server.py                FastAPI app, the single `/run` endpoint
   session.py               per-connection state + method routing table
+  modeldb.py               the model list: fetch, disk copy, refresh rules
   runs.py                  server-wide run registry (attach/status, 5-min retain)
   protocol.py              envelope `{m, id, d}`: pack/unpack, payload builders
   progress.py              bar windows, stage/rate/ETA accounting, throttling
@@ -165,6 +185,7 @@ src/reline_ws/
     run.py                 start / stop / status / attach and the run job
     fs.py                  ls (path autocompletion)
     configs.py             config_list / config_read / config_delete
+    model_db.py            models (the model list)
   gate.py                  the exclusive-run gate
   patches.py               fix for an upstream reline bug (see below)
 tests/                     script tests, `python tests/run.py`

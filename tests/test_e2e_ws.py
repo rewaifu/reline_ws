@@ -443,6 +443,9 @@ def main() -> int:
             # expected to send nothing but the pipeline
             "RELINE_ROOT": os.path.join(tmp, "base"),
             "RELINE_MODELS_DIR": "weights",
+            # the test needs no model list: no network, no cache in $HOME
+            "RELINE_MODELS_DB_URL": "",
+            "RELINE_CACHE_DIR": os.path.join(tmp, "cache"),
         },
         stdout=log_file,
         stderr=subprocess.STDOUT,

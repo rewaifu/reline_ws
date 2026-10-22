@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__, patches
 from .gate import BusyGate
@@ -27,6 +29,29 @@ from .session import Connection
 logger = logging.getLogger("uvicorn.error")
 
 
+async def watch_loop_lag(*, interval: float = 1.0, threshold: float = 3.0) -> None:
+    """Say so in the log when something blocks the event loop.
+
+    A blocked loop answers nothing — no `echo`, no `ls`, no new connection — and
+    from the outside that is indistinguishable from a dead server: clients drop
+    the socket and cannot redial until it clears. The cause is always code that
+    should have been in a worker thread, and without this line the only symptom
+    is "the UI disconnects when a run starts".
+    """
+    last = time.monotonic()
+    while True:
+        await asyncio.sleep(interval)
+        now = time.monotonic()
+        lag = now - last - interval
+        if lag > threshold:
+            logger.warning(
+                "event loop was blocked for %.1fs: heartbeats and new connections "
+                "were not served meanwhile",
+                lag,
+            )
+        last = now
+
+
 def create_app(
     *,
     root: str | None = None,
@@ -34,6 +59,7 @@ def create_app(
     gate: BusyGate | None = None,
     cache_dir: str | None = None,
     model_db: ModelCatalog | None = None,
+    presets_dir: str | None = None,
 ) -> FastAPI:
     """App factory.
 
@@ -41,6 +67,9 @@ def create_app(
     `RELINE_MODELS_DIR` (or the `--root` / `--models` flags of `app.py`) are how
     a machine says where its data and models live, so the UI only has to know
     the address. A run may still override either one in `start`.
+
+    `presets_dir` (`RELINE_PRESETS_DIR`) is where the presets a user saves in the
+    UI are kept on this machine; without it the runner stores none.
 
     `cache_dir` (`RELINE_CACHE_DIR`) is where the runner keeps what it fetched
     for clients — today the model list. `RELINE_MODELS_DB_URL` overrides the
@@ -67,12 +96,29 @@ def create_app(
         # so a slow or unreachable database never delays the runner starting
         catalog.load_cache()
         refreshing = asyncio.create_task(catalog.refresh())
+        watching = asyncio.create_task(watch_loop_lag())
         try:
             yield
         finally:
             refreshing.cancel()
+            watching.cancel()
 
     app = FastAPI(title="reline_ws", version=__version__, lifespan=lifespan)
+    # `/health` is read by the UI straight from the browser (is the link up, is a
+    # run going): without CORS the page could not tell this server's answer from
+    # a network failure. Only GET, and WebSockets are not subject to CORS at all.
+    origins = [
+        item.strip()
+        for item in os.environ.get("RELINE_CORS_ORIGINS", "*").split(",")
+        if item.strip()
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_methods=["GET"],
+        allow_headers=["*"],
+        expose_headers=["X-Krot-Link", "Retry-After"],
+    )
     busy_gate = gate if gate is not None else BusyGate()
     registry = RunRegistry(busy_gate)
     raw_root = root if root is not None else os.environ.get("RELINE_ROOT")
@@ -85,6 +131,8 @@ def create_app(
     # `--models weights` under `--root /data` means `/data/weights`, the same
     # rule every other path follows
     default_models = resolve_path(raw_models, default_root) if raw_models else None
+    raw_presets = presets_dir if presets_dir is not None else os.environ.get("RELINE_PRESETS_DIR")
+    default_presets = resolve_path(raw_presets, default_root) if raw_presets else None
 
     @app.get("/health")
     async def health() -> dict[str, object]:
@@ -105,6 +153,7 @@ def create_app(
             "root": default_root,
             "models": default_models,
             "model_db": catalog.describe(),
+            "presets": default_presets,
             "run_id": registry.current().run_id if registry.current() is not None else None,
         }
 
@@ -118,6 +167,7 @@ def create_app(
             models_dir=default_models,
             registry=registry,
             model_db=catalog,
+            presets_dir=default_presets,
         )
         try:
             while True:

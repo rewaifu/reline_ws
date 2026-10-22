@@ -67,6 +67,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         "list); default: RELINE_CACHE_DIR, then ~/.cache/reline_ws",
     )
     parser.add_argument(
+        "--presets-dir",
+        default=os.environ.get("RELINE_PRESETS_DIR"),
+        help="folder where the presets saved in the UI are kept on this "
+        "machine; a relative value goes under --root (default: "
+        "RELINE_PRESETS_DIR; unset = presets are not stored here)",
+    )
+    parser.add_argument(
+        "--ws-ping-timeout",
+        type=float,
+        default=float(os.environ.get("RELINE_WS_PING_TIMEOUT", "60")),
+        help="seconds a WebSocket may ignore the server's ping before it is "
+        "closed (default: %(default)s; uvicorn's own default is 20)",
+    )
+    parser.add_argument(
         "--no-proxy-headers",
         action="store_true",
         help="ignore X-Forwarded-* (the default trusts a local reverse proxy)",
@@ -74,9 +88,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     uvicorn.run(
-        create_app(root=args.root, models_dir=args.models, cache_dir=args.cache_dir),
+        create_app(
+            root=args.root,
+            models_dir=args.models,
+            cache_dir=args.cache_dir,
+            presets_dir=args.presets_dir,
+        ),
         host=args.host,
         port=args.port,
+        # a long image is a long time in a worker thread; the default 20 s ping
+        # timeout closed healthy sockets behind a slow tunnel
+        ws_ping_timeout=args.ws_ping_timeout,
         proxy_headers=not args.no_proxy_headers,
         forwarded_allow_ips="*",
     )

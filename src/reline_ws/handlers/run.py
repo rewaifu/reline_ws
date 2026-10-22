@@ -183,7 +183,12 @@ async def _run_job(
         if not cancelled:
             await tracker.begin_phase(Phase.PROCESS)
             read_window, image_window = pipeline_windows()
-            pipeline = PipelineWs.build(nodes, postprocess)
+            # `build` constructs every node, and an upscale node loads its model
+            # (disk, CUDA init) right there: seconds of blocking work. On the
+            # event loop it froze the heartbeat and every other socket — the
+            # client then gave the connection up as dead exactly when a run
+            # started, and could not redial until the load was over.
+            pipeline = await asyncio.to_thread(PipelineWs.build, nodes, postprocess)
             cancelled = not await pipeline.run(tracker, record.cancel_event, read_window, image_window)
         if not cancelled:
             await tracker.finish()

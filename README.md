@@ -26,14 +26,32 @@ Launch parameters — where this machine reads and writes:
 | `--port`    | `RELINE_PORT`        | `8000`            | port to bind                                                     |
 | `--cache-dir` | `RELINE_CACHE_DIR` | `~/.cache/reline_ws` | where the runner keeps what it fetched for clients (the model list) |
 | *(env only)* | `RELINE_MODELS_DB_URL` | `https://mdb.yor.ovh/v1/files` | the model database address; empty = no network, serve the disk copy only |
+| `--presets-dir` | `RELINE_PRESETS_DIR` | *(unset)* | folder for the presets saved in the UI (relative = under `--root`); unset = the runner stores none |
+| `--ws-ping-timeout` | `RELINE_WS_PING_TIMEOUT` | `60` | seconds a WebSocket may ignore the server's ping before it is closed (uvicorn's own default is 20) |
+| *(env only)* | `RELINE_CORS_ORIGINS` | `*` | origins allowed to read `GET /health` from a browser |
 | `--no-proxy-headers` | —           | off               | ignore `X-Forwarded-*` instead of trusting a local proxy         |
 
-`GET /health` reports them back (`"root"`, `"models"`, and `"model_db"` — how
+`GET /health` reports them back (`"root"`, `"models"`, `"presets"`, and `"model_db"` — how
 many models are known, when they were fetched, the last error), so which folder
 a deployment is using is one curl away.
 
 One run at a time across all connections (GPU-bound work): a second `start`
 answers `error {"worker busy"}`.
+
+## Presets
+
+With `RELINE_PRESETS_DIR` set, the presets a user saves in the UI are kept as files in that folder
+(`config_list` / `config_read` / `config_write` / `config_delete`, see `WS_API.md`): one JSON file
+per preset, written atomically, the folder created on the first write. Without it `config_list`
+answers `enabled: false` and the UI says the runner stores nothing.
+
+## Keeping the event loop free
+
+A blocked event loop answers nothing — no `echo`, no `ls`, no new connection — and a client cannot
+tell it from a dead server, so it drops the socket exactly when a run starts. Everything heavy
+(building the pipeline, which loads the models; reading, processing, writing images; unpacking
+archives) therefore runs in worker threads. If something still blocks the loop for more than three
+seconds the log says so (`event loop was blocked for N s`) — that line names the bug.
 
 ## Model list
 

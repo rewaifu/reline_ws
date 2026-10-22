@@ -27,6 +27,7 @@ from .protocol import (
     M_CONFIG_DELETE,
     M_CONFIG_LIST,
     M_CONFIG_READ,
+    M_CONFIG_WRITE,
     M_ECHO,
     M_LS,
     M_MODELS,
@@ -58,6 +59,7 @@ ROUTES: dict[str, Handler] = {
     M_CONFIG_LIST: configs.handle_list,
     M_CONFIG_READ: configs.handle_read,
     M_CONFIG_DELETE: configs.handle_delete,
+    M_CONFIG_WRITE: configs.handle_write,
     M_MODELS: model_db.handle_models,
 }
 
@@ -72,6 +74,7 @@ class Connection:
         models_dir: str | None = None,
         registry: RunRegistry | None = None,
         model_db: ModelCatalog | None = None,
+        presets_dir: str | None = None,
     ) -> None:
         self.ws = ws
         self.gate = gate
@@ -90,7 +93,13 @@ class Connection:
             resolve_path(models_dir, self.root) if models_dir else None
         )
         self.models_dir: str | None = None
-        self.configs_dir: str | None = None
+        #: the deployment's presets folder (`RELINE_PRESETS_DIR`): where saved
+        #: presets live without the client having to name a path. A `start` that
+        #: carries its own `configs` still overrides it.
+        self.default_configs_dir: str | None = (
+            resolve_path(presets_dir, self.root) if presets_dir else None
+        )
+        self.configs_dir: str | None = self.default_configs_dir
         #: run_id -> request id: runs this connection watches. Every run event
         #: is delivered with the watching connection's own request id, so two
         #: tabs attached to one run do not share envelope ids.

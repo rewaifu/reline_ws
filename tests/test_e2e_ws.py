@@ -446,6 +446,7 @@ def main() -> int:
             # the test needs no model list: no network, no cache in $HOME
             "RELINE_MODELS_DB_URL": "",
             "RELINE_CACHE_DIR": os.path.join(tmp, "cache"),
+            "RELINE_PRESETS_DIR": "presets",
         },
         stdout=log_file,
         stderr=subprocess.STDOUT,
@@ -466,6 +467,11 @@ def main() -> int:
             checks.eq("…with the version", health.json()["ok"], True)
             checks.eq("…and the launch root it reads from", health.json()["root"], os.path.join(tmp, "base"))
             checks.eq("…including a relative models folder", health.json()["models"], os.path.join(tmp, "base", "weights"))
+            checks.eq("…and the presets folder under the same root", health.json()["presets"], os.path.join(tmp, "base", "presets"))
+            # the page reads /health from another origin: without CORS it could not
+            # tell this server's answer from a network failure
+            cors = http.get("/health", headers={"Origin": "https://ui.example"})
+            checks.eq("health is readable from a page on another origin", cors.headers.get("access-control-allow-origin"), "*")
             checks.eq("a plain GET on /run is not a route", http.get("/run").status_code, 404)
 
         # Everything the deliberate failures above wrote is behind us: only what
